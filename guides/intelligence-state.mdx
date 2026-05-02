@@ -1,0 +1,374 @@
+---
+title: "Intelligence state model in AgentCore"
+description: "Write and query tasks, claims, evidence, decisions, and memories via runtime.intelligence, with reactive subscriptions and declarative routing."
+---
+
+AgentCore includes a first-class intelligence state model inside the native state subsystem. Rather than encoding agent reasoning artifacts as fields in a generic JSON blob, the intelligence layer stores them in typed record categories that participate in the same patch commits, checkpoints, replay, and persistent subgraph sessions as ordinary workflow state.
+
+The five record types are:
+
+- **tasks** — active or planned work items
+- **claims** — asserted propositions with a subject/relation/object shape
+- **evidence** — supporting material linked to a task or claim
+- **decisions** — accepted or rejected choices linked to a task or claim
+- **memories** — short-lived or session-local notes with importance scoring
+
+## Writing records
+
+Access intelligence operations through `runtime.intelligence` in any node that accepts a third `runtime` argument.
+
+```python
+from agentcore.graph import END, START, RuntimeContext, StateGraph
+
+
+def analyze(state, config, runtime: RuntimeContext):
+    # Tasks
+    runtime.intelligence.upsert_task(
+        "triage",
+        title="Inspect inbound request",
+        owner="planner",
+        status="in_progress",
+        priority=4,
+        details={"request_id": state["request_id"]},
+    )
+
+    # Claims
+    runtime.intelligence.upsert_claim(
+        "needs-escalation",
+        subject="request",
+        relation="requires",
+        object="escalation",
+        status="proposed",
+        confidence=0.74,
+        statement={"reason": "account mismatch"},
+    )
+
+    # Evidence linked to the claim
+    runtime.intelligence.add_evidence(
+        "ticket-snippet",
+        kind="ticket",
+        source="support",
+        claim_key="needs-escalation",
+        content={"excerpt": state["excerpt"]},
+        confidence=0.82,
+    )
+
+    # Decision linked to both task and claim
+    runtime.intelligence.record_decision(
+        "send-to-review",
+        task_key="triage",
+        claim_key="needs-escalation",
+        status="selected",
+        summary={"queue": "human-review"},
+        confidence=0.91,
+    )
+
+    # Memory entry
+    runtime.intelligence.remember(
+        "customer-tone",
+        layer="working",
+        scope="request",
+        content={"tone": "urgent"},
+        importance=0.6,
+    )
+
+    return {}
+
+
+graph = StateGraph(dict, name="intelligence_demo")
+graph.add_node("analyze", analyze)
+graph.add_edge(START, "analyze")
+graph.add_edge("analyze", END)
+```
+
+<Note>
+Intelligence writes follow the same commit rule as other state patches. A node stages writes into `StatePatch::intelligence`, the engine commits that patch once for the step, and checkpoints, traces, and replay all observe the same committed result.
+</Note>
+
+## Querying records
+
+### Snapshot and summary
+
+Get the full current state, including staged writes from the active callback:
+
+```python
+snapshot = runtime.intelligence.snapshot()
+# {"counts": {...}, "tasks": [...], "claims": [...], "evidence": [...],
+#  "decisions": [...], "memories": [...]}
+
+summary = runtime.intelligence.summary()
+# {"counts": {"tasks": 1, "claims": 1, ...}, "task_status": {...}, ...}
+```
+
+### Filtered queries
+
+```python
+# All claims matching a semantic pattern
+claims = runtime.intelligence.query(
+    kind="claims",
+    subject="request",
+    relation="requires",
+    object="escalation",
+)
+
+# Count without materializing records
+count = runtime.intelligence.count(
+    kind="tasks",
+    owner="planner",
+    status="in_progress",
+)
+
+# Presence check
+if runtime.intelligence.exists(kind="tasks", owner="planner"):
+    ...
+```
+
+### Task agenda
+
+```python
+# All tasks for "planner" ranked by status class, priority, confidence, id
+agenda = runtime.intelligence.agenda(owner="planner")
+tasks = agenda["tasks"]
+
+# First ranked task or None
+next_task = runtime.intelligence.next_task(owner="planner")
+if next_task:
+    print(next_task["key"], next_task["status"], next_task["priority"])
+```
+
+Task agenda ranking order: `in_progress` > `open` > `blocked` > `completed` > `cancelled`, then descending priority, descending confidence, ascending stable id.
+
+### Supporting claims
+
+```python
+# Claims ranked by support from linked evidence, decisions, and memories
+# for the "triage" task
+supporting = runtime.intelligence.supporting_claims(
+    task_key="triage",
+    limit=3,
+)
+for claim in supporting["claims"]:
+    print(claim["key"], claim["confidence"])
+```
+
+### Action candidates
+
+```python
+# Tasks ranked by direct anchor match and linked support — useful for
+# asking "what should I do next?" without a full focus set
+candidates = runtime.intelligence.action_candidates(
+    owner="planner",
+    subject="request",
+    relation="requires",
+    object="escalation",
+    limit=2,
+)
+top_task = candidates["tasks"][0]["key"]
+```
+
+### Memory recall
+
+```python
+# Memories ranked by descending importance
+recalled = runtime.intelligence.recall(scope="request", limit=5)
+for memory in recalled["memories"]:
+    print(memory["key"], memory["importance"])
+```
+
+### Focus
+
+`focus()` returns a bounded cross-kind snapshot seeded from direct anchors, the current task agenda, and memory recall. It is useful when a workflow needs all record types relevant to the current frontier in one call.
+
+```python
+focus = runtime.intelligence.focus(
+    owner="planner",
+    scope="request",
+    limit=5,
+)
+# {"tasks": [...], "claims": [...], "evidence": [...],
+#  "decisions": [...], "memories": [...]}
+```
+
+### Neighborhood expansion
+
+```python
+# Records connected to a task, up to 2 hops
+related = runtime.intelligence.related(task_key="triage", hops=2)
+print(related["counts"])
+```
+
+## Full example with all query methods
+
+```python
+def analyze(state, config, runtime: RuntimeContext):
+    # ... writes from earlier example ...
+
+    summary = runtime.intelligence.summary()
+    supporting_claims = runtime.intelligence.supporting_claims(
+        task_key="triage", limit=3
+    )
+    action_candidates = runtime.intelligence.action_candidates(
+        owner="planner",
+        subject="request",
+        relation="requires",
+        object="escalation",
+        limit=2,
+    )
+    semantic_claims = runtime.intelligence.query(
+        kind="claims",
+        subject="request",
+        relation="requires",
+        object="escalation",
+    )
+    related = runtime.intelligence.related(task_key="triage", hops=2)
+    next_task = runtime.intelligence.next_task(owner="planner")
+    recalled_memories = runtime.intelligence.recall(scope="request", limit=3)
+    focus = runtime.intelligence.focus(owner="planner", scope="request", limit=3)
+
+    return {
+        "decision_count": summary["counts"]["decisions"],
+        "supporting_claim_count": supporting_claims["counts"]["claims"],
+        "action_candidate_key": action_candidates["tasks"][0]["key"],
+        "semantic_claim_count": semantic_claims["counts"]["claims"],
+        "related_claim_count": related["counts"]["claims"],
+        "next_task_key": None if next_task is None else next_task["key"],
+        "working_memory_count": recalled_memories["counts"]["memories"],
+        "focus_claim_count": focus["counts"]["claims"],
+    }
+
+details = graph.compile().invoke_with_metadata(
+    {"request_id": "req-7", "excerpt": "Please fix this today"}
+)
+print(details["intelligence"]["counts"])
+print(details["intelligence"]["claims"][0]["key"])
+```
+
+## Declarative routing with IntelligenceRule
+
+For conditional edges that route based on intelligence state, `IntelligenceRule` and `IntelligenceRouter` provide a compact declarative layer.
+
+```python
+from agentcore.graph import IntelligenceRule, IntelligenceRouter, START, StateGraph
+
+
+router = IntelligenceRouter(
+    rules=[
+        IntelligenceRule(
+            goto="escalate",
+            kind="claims",
+            subject="request",
+            relation="requires",
+            object="escalation",
+            status="proposed",
+            min_confidence=0.7,
+        ),
+        IntelligenceRule(
+            goto="resolve",
+            kind="tasks",
+            owner="planner",
+            status="in_progress",
+        ),
+    ],
+    default="review",
+)
+
+graph = StateGraph(dict, name="routing_demo")
+graph.add_node("analyze", analyze)
+graph.add_node("escalate", escalate)
+graph.add_node("resolve", resolve)
+graph.add_node("review", review)
+graph.add_edge(START, "analyze")
+graph.add_conditional_edges("analyze", router, {
+    "escalate": "escalate",
+    "resolve": "resolve",
+    "review": "review",
+})
+```
+
+`IntelligenceRouter` evaluates the rules in order and returns the `goto` value of the first matching rule, or `default` if no rule matches.
+
+## Intelligence-reactive nodes
+
+Nodes can subscribe to committed intelligence changes. When a matching delta is committed, the runtime schedules the subscribed node through the native reactive frontier.
+
+```python
+from agentcore.graph import IntelligenceSubscription, START, StateGraph
+
+
+def write_claim(state, config, runtime):
+    runtime.intelligence.upsert_claim(
+        "claim:reactive",
+        subject="agentcore",
+        relation="supports",
+        object="reactive_runtime",
+        status="supported",
+    )
+    return {}
+
+
+def react_to_supported_claim(state, config):
+    return {"reactive_seen": True}
+
+
+graph = StateGraph(dict, name="intelligence_reactive")
+graph.add_node("write", write_claim)
+graph.add_node(
+    "react",
+    react_to_supported_claim,
+    kind="aggregate",
+    stop_after=True,
+    intelligence_subscriptions=[
+        IntelligenceSubscription(
+            subject="agentcore",
+            relation="supports",
+            object="reactive_runtime",
+        ),
+    ],
+)
+graph.add_edge(START, "write")
+```
+
+The subscription is compiled into native graph metadata. Duplicate no-op writes do not retrigger the reactive frontier. Pending reruns are checkpointed and restored the same way as other reactive frontiers.
+
+<Tip>
+Claim subscriptions can match on `subject`, `relation`, and `object` independently or in combination. Use `kind="claims"` when you want the subscription to fire only on claim deltas, or omit `kind` to match across all intelligence record types.
+</Tip>
+
+## IntelligenceSubscription and IntelligenceRule signatures
+
+```python
+IntelligenceSubscription(
+    kind=None,           # "tasks", "claims", "evidence", "decisions", "memories", or None for all
+    key=None,            # exact record key
+    key_prefix=None,     # key prefix match
+    task_key=None,       # task link filter
+    claim_key=None,      # claim link filter
+    subject=None,        # semantic filter (claims only)
+    relation=None,       # semantic filter (claims only)
+    object=None,         # semantic filter (claims only)
+    owner=None,          # owner filter (tasks)
+    source=None,         # source filter (evidence)
+    scope=None,          # scope filter (memories)
+    status=None,         # status filter (tasks, claims, decisions)
+    layer=None,          # layer filter (memories)
+    min_confidence=None, # minimum confidence threshold
+    min_importance=None, # minimum importance threshold (memories)
+)
+
+IntelligenceRule(
+    goto,                # route name to return when the rule matches
+    # ... same filter fields as IntelligenceSubscription ...
+    min_count=1,         # minimum number of matching records required
+    max_count=None,      # maximum number of matching records allowed
+)
+```
+
+## Intelligence in invoke_with_metadata
+
+`invoke_with_metadata(...)` includes the committed intelligence snapshot under `details["intelligence"]` when the run commits any intelligence records:
+
+```python
+details = graph.compile().invoke_with_metadata({"request_id": "req-1", "excerpt": "urgent"})
+counts = details["intelligence"]["counts"]
+first_claim = details["intelligence"]["claims"][0]
+```

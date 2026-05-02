@@ -1,0 +1,264 @@
+---
+title: "Context assembly for agent nodes in AgentCore"
+description: "Declare a ContextSpec on a node, select from messages, intelligence records, and knowledge triples, and render a bounded prompt with citations."
+---
+
+Agent nodes often need a bounded, cited view of runtime state before calling a model. AgentCore provides a `ContextSpec` declaration at graph-build time and a `ContextView` returned at execution time. The context view assembles records from message history, structured intelligence state, native knowledge-graph triples, and selected state fields — all without a separate memory store or model call.
+
+## Declaring a ContextSpec
+
+Attach a `ContextSpec` to a node when calling `add_node(...)`. The spec is compiled into native graph metadata. Inside the node callback, call `runtime.context.view()` to assemble the view.
+
+```python
+from agentcore.graph import ContextSpec, END, START, StateGraph
+
+
+def answer(state, config, runtime):
+    context = runtime.context.view()
+    prompt = context.to_prompt(system="Answer using cited evidence.")
+    result = runtime.invoke_model("default", prompt, decode="text")
+    return {
+        "answer": result,
+        "context_digest": context.digest,
+        "context_items": len(context),
+    }
+
+
+graph = StateGraph(dict, name="context_demo")
+graph.add_node(
+    "answer",
+    answer,
+    context=ContextSpec(
+        goal_key="question",
+        include=["messages.recent", "claims.supported", "evidence.relevant"],
+        budget_tokens=2400,
+        require_citations=True,
+    ),
+)
+graph.add_edge(START, "answer")
+graph.add_edge("answer", END)
+```
+
+## ContextSpec parameters
+
+```python
+ContextSpec(
+    goal_key=None,           # parent state field whose value is the context goal
+    include=None,            # list of selector strings
+    budget_tokens=None,      # soft token budget for assembled items
+    budget_items=32,         # maximum number of items regardless of token budget
+    require_citations=False, # include citation ids in the view
+    freshness="staged",      # whether to include staged (uncommitted) writes
+    message_key="messages",  # state field containing message history
+    limit_per_source=5,      # maximum items from any single selector
+    task_key=None,           # anchor intelligence queries to this task
+    claim_key=None,          # anchor intelligence queries to this claim
+    owner=None,              # filter intelligence records by owner
+    scope=None,              # filter memory records by scope
+    subject=None,            # semantic filter for claim records
+    relation=None,           # semantic filter for claim records
+    object=None,             # semantic filter for claim records
+    source=None,             # filter evidence records by source
+)
+```
+
+## Supported selectors
+
+Pass selector strings in the `include` list. You can combine selectors from different categories in one spec.
+
+<Tabs>
+  <Tab title="Message selectors">
+    | Selector | Description |
+    |---|---|
+    | `messages.recent` | Most recent messages from the configured `message_key` field |
+    | `messages.all` | All messages from the configured `message_key` field |
+
+    ```python
+    ContextSpec(
+        goal_key="question",
+        include=["messages.recent"],
+        budget_tokens=1000,
+    )
+    ```
+  </Tab>
+  <Tab title="Intelligence selectors">
+    | Selector | Description |
+    |---|---|
+    | `tasks.agenda` | Tasks ranked by operational priority |
+    | `claims.supported` | Claims with `status="supported"` |
+    | `claims.confirmed` | Claims with `status="confirmed"` |
+    | `claims.all` | All claims |
+    | `evidence.relevant` | Evidence linked to active tasks or claims |
+    | `evidence.all` | All evidence records |
+    | `decisions.selected` | Decisions with `status="selected"` |
+    | `decisions.all` | All decisions |
+    | `memories.working` | Working-layer memories |
+    | `memories.episodic` | Episodic-layer memories |
+    | `memories.semantic` | Semantic-layer memories |
+    | `memories.procedural` | Procedural-layer memories |
+    | `memories.recall` | Memories ranked by importance |
+    | `actions.candidates` | Tasks ranked as action candidates |
+    | `intelligence.focus` | Cross-kind focus set around the active frontier |
+
+    ```python
+    ContextSpec(
+        goal_key="question",
+        include=["tasks.agenda", "claims.supported", "evidence.relevant", "decisions.selected"],
+        budget_tokens=2000,
+        require_citations=True,
+    )
+    ```
+  </Tab>
+  <Tab title="Knowledge selectors">
+    | Selector | Description |
+    |---|---|
+    | `knowledge.neighborhood` | Native `runtime.knowledge` triples; falls back to graph-shaped state under `knowledge_graph`, `knowledge`, or `triples` |
+    | `state.<field_name>` | Arbitrary state field value |
+
+    ```python
+    ContextSpec(
+        goal_key="question",
+        include=["knowledge.neighborhood", "state.loaded_triples"],
+        subject="Incident",
+        require_citations=True,
+    )
+    ```
+  </Tab>
+</Tabs>
+
+## Full example with multiple selectors
+
+This example populates intelligence and knowledge state in a `prepare` node, then assembles context in an `answer` node.
+
+```python
+from agentcore.graph import ContextSpec, END, START, StateGraph
+
+
+def prepare(state, config, runtime):
+    runtime.knowledge.upsert_triple(
+        "AgentCore",
+        "stores",
+        "native knowledge triples",
+        payload={"source": "quickstart"},
+    )
+    runtime.intelligence.upsert_claim(
+        "claim:native-runtime",
+        subject="agentcore",
+        relation="uses",
+        object="native runtime",
+        status="supported",
+        confidence=0.9,
+    )
+    runtime.intelligence.add_evidence(
+        "evidence:runtime",
+        kind="doc",
+        source="architecture",
+        claim_key="claim:native-runtime",
+        content={"note": "graph execution is native"},
+        confidence=0.85,
+    )
+    return {
+        "messages": [{"role": "user", "content": state["question"]}],
+    }
+
+
+def answer(state, config, runtime):
+    context = runtime.context.view()
+    prompt = context.to_prompt(system="Answer with cited context.")
+    return {
+        "prompt": prompt,
+        "context_digest": context.digest,
+        "context_items": len(context),
+    }
+
+
+graph = StateGraph(dict, name="context_demo")
+graph.add_node("prepare", prepare)
+graph.add_node(
+    "answer",
+    answer,
+    context=ContextSpec(
+        goal_key="question",
+        include=[
+            "messages.recent",
+            "claims.supported",
+            "evidence.relevant",
+            "knowledge.neighborhood",
+        ],
+        budget_tokens=1200,
+        require_citations=True,
+    ),
+)
+graph.add_edge(START, "prepare")
+graph.add_edge("prepare", "answer")
+graph.add_edge("answer", END)
+
+details = graph.compile().invoke_with_metadata({"question": "What is AgentCore?"})
+print(details["state"]["context_digest"])
+print(details["context"]["combined_digest"])
+```
+
+## ContextView surface
+
+`runtime.context.view()` returns a `ContextView` with the following properties and methods:
+
+| Member | Description |
+|---|---|
+| `.spec` | The `ContextSpec` that produced this view |
+| `.goal` | Value of the `goal_key` state field |
+| `.items` | Ordered list of context items |
+| `.provenance` | Provenance records for each item |
+| `.conflicts` | Conflict metadata for supported/confirmed claims that disagree on the same subject/relation |
+| `.budget` | Approximate token and item budget accounting |
+| `.digest` | Stable digest of the view contents |
+| `.to_dict()` | Context as a plain Python dictionary |
+| `.to_prompt(system=None)` | Renders context as a text prompt string |
+| `.to_messages(system=None)` | Renders context as a list of chat-style message dicts |
+| `.to_model_input(mode=...)` | Compact adapter-facing form; `mode` is `"text"`, `"messages"`, `"dict"`, or `"protocol"` |
+
+```python
+def answer(state, config, runtime):
+    context = runtime.context.view()
+
+    # Use as a text prompt
+    text_prompt = context.to_prompt(system="Be concise.")
+
+    # Use as chat messages
+    chat_messages = context.to_messages(system="Be concise.")
+
+    # Check what was assembled
+    print(f"Items: {len(context.items)}, budget used: {context.budget}")
+    print(f"Digest: {context.digest}")
+
+    return {"prompt": text_prompt}
+```
+
+## Context metadata in invoke_with_metadata
+
+When a node creates a context view during `invoke_with_metadata(...)`, the returned details include:
+
+- `details["context"]["combined_digest"]` — digest of all context views created during the run
+- Matching trace events include `context_views` and `context_digest` fields
+- `details["proof"]["context_digest"]` — Python-level context-view digest for cross-run comparison
+
+```python
+details = compiled.invoke_with_metadata({"question": "What changed?"})
+print(details["context"]["combined_digest"])
+print(details["proof"]["context_digest"])
+```
+
+## Native ranking for intelligence and knowledge selectors
+
+For selectors backed by intelligence records or native knowledge triples, `runtime.context.view()` uses an internal native context-graph ranker before returning the Python `ContextView`. The ranker:
+
+1. Compiles the `ContextSpec` into an internal query plan.
+2. Builds typed adjacency over `IntelligenceStore` records and `KnowledgeGraphStore` triples.
+3. Propagates deterministic integer activation scores across task links, claim links, and subject/relation/object matches.
+4. Applies motif-aware boosts for supported structures such as claim + evidence, claim + selected decision, and exact claim-to-knowledge-triple matches.
+5. Prunes with kind-balanced top-k so one dense record type cannot crowd out the others.
+
+Message and `state.<field>` items are merged in on the Python side, so the public `ContextView` shape is consistent regardless of which selectors are used.
+
+<Tip>
+Repeated `runtime.context.view()` calls inside the same callback reuse a cached native result until staged intelligence or knowledge writes change the cache fingerprint. This keeps read-your-own-writes semantics intact without repeating the full native ranking pass.
+</Tip>

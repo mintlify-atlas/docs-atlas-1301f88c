@@ -1,81 +1,233 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
-icon: 'rocket'
+title: "AgentCore quickstart: install and run your first graph"
+description: "Install AgentCore, define a StateGraph, compile it, and invoke your first graph — then explore streaming events, run metadata, and pause and resume."
 ---
 
-## Get started in three steps
+AgentCore gives you a `StateGraph`-style Python API backed by a native C++20 execution kernel. You describe a workflow as nodes and edges, nodes return state patches, and the runtime commits those patches deterministically — handling routing, checkpointing, streaming, and persistent subgraph sessions from the same execution path. This guide walks you from installation through your first running graph, then shows how to stream events and inspect run metadata.
 
-Get your documentation site running locally and make your first customization.
+<Steps>
+  <Step title="Install AgentCore">
+    The published package is `agentcore-graph` on PyPI. The import package inside your code is `agentcore`.
 
-### Step 1: Set up your local environment
+    <CodeGroup>
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+    ```bash pip
+    python3 -m pip install agentcore-graph
+    ```
 
-### Step 2: Deploy your changes
+    ```bash with OpenTelemetry
+    python3 -m pip install "agentcore-graph[otel]"
+    ```
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    ```bash with Neo4j graph store
+    python3 -m pip install "agentcore-graph[neo4j]"
+    ```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    </CodeGroup>
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    Verify the install by importing `StateGraph`:
 
-### Step 3: Go live
+    ```bash
+    python3 -c "from agentcore.graph import StateGraph; print('ok')"
+    ```
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+    <Note>
+      Published wheels currently target Linux `x86_64` for CPython 3.9 through 3.12. Source builds are available from the repository for other environments.
+    </Note>
 
-## Next steps
+    The package also installs three MCP helper commands you can use after installation:
 
-Now that you have your docs running, explore these key features:
+    ```bash
+    agentcore-mcp --help
+    agentcore-mcp-server --help
+    agentcore-mcp-config --help
+    ```
+  </Step>
+
+  <Step title="Define a minimal StateGraph">
+    A graph is built from nodes and edges. Nodes are plain Python functions that receive the current state and return a mapping of updates — not mutations of shared state, but a patch that the runtime commits at a single point.
+
+    This example increments a counter until the route function decides to stop:
+
+    ```python
+    from agentcore.graph import END, START, StateGraph
+
+
+    def step(state, config):
+        next_count = int(state.get("count", 0)) + 1
+        return {"count": next_count}
+
+
+    def route(state, config):
+        return END if state["count"] >= 3 else "step"
+
+
+    graph = StateGraph(dict, name="counter", worker_count=2)
+    graph.add_node("step", step)
+    graph.add_edge(START, "step")
+    graph.add_conditional_edges("step", route, {END: END, "step": "step"})
+    ```
+
+    The key pieces:
+
+    - `StateGraph(dict, name=..., worker_count=...)` defines the graph and native worker parallelism.
+    - `add_node(...)` registers a node callback. Callbacks can be synchronous or async.
+    - `add_edge(...)` and `add_conditional_edges(...)` describe routing.
+    - Node callbacks may accept `state`, `(state, config)`, or `(state, config, runtime)`.
+
+    <Tip>
+      Returning a partial mapping (`{"count": next_count}`) instead of a full state copy is the expected pattern. The runtime merges that patch into the committed state snapshot — this is what makes checkpointing, replay, and streaming consistent with state mutation.
+    </Tip>
+  </Step>
+
+  <Step title="Compile and invoke">
+    Once the graph structure is defined, compile it into the native runtime and call `invoke`:
+
+    ```python
+    compiled = graph.compile()
+    final_state = compiled.invoke({"count": 0})
+    print(final_state["count"])  # 3
+    ```
+
+    `compile()` lowers the graph definition into native runtime metadata. `invoke(...)` executes one run and returns the final state mapping.
+
+    If a node is deterministic for a declared subset of state keys, you can opt into native memoization at graph-build time:
+
+    ```python
+    graph.add_node(
+        "score",
+        score_candidate,
+        deterministic=True,
+        read_keys=["candidate_id", "rubric_version"],
+        cache_size=32,
+    )
+    ```
+
+    The cache lives in the native runtime and is invalidated when any declared `read_keys` field changes.
+  </Step>
+
+  <Step title="Stream events">
+    The same compiled graph can yield public execution events as the run progresses. Today the Python stream surface supports `stream_mode="events"`:
+
+    ```python
+    events = list(compiled.stream({"count": 0}))
+    for event in events:
+        print(event)
+    ```
+
+    For async code, use `astream(...)`:
+
+    ```python
+    async def run_stream():
+        async for event in compiled.astream({"count": 0}):
+            print(event)
+    ```
+
+    Each event carries node name, step metadata, and — when a persistent subgraph session is in use — `session_id`, `session_revision`, and `namespaces`.
+
+    <Note>
+      Stream events are derived from runtime trace data, not a separate event pipeline. That keeps the observable surface aligned with the execution record.
+    </Note>
+  </Step>
+
+  <Step title="Inspect run metadata">
+    Use `invoke_with_metadata(...)` to get the final state along with a summary, trace events, proof digest, and context metadata in one call:
+
+    ```python
+    details = compiled.invoke_with_metadata({"count": 0})
+
+    # Final state
+    print(details["state"]["count"])        # 3
+
+    # Run summary and checkpoint id
+    print(details["summary"]["checkpoint_id"])
+
+    # Trace events (one per step)
+    for event in details["trace"]:
+        print(event["node_name"], event["step"])
+    ```
+
+    `invoke_with_metadata(...)` returns the same final state as `invoke(...)` plus structured run metadata, making it useful for debugging, auditing, and replay validation.
+
+    To add OpenTelemetry spans and metrics, pass an observer:
+
+    ```python
+    from agentcore.observability import OpenTelemetryObserver
+
+    observer = OpenTelemetryObserver()
+    details = compiled.invoke_with_metadata({"count": 0}, telemetry=observer)
+    ```
+
+    Pass `telemetry=True` as shorthand for a default observer when you want spans without constructing one explicitly.
+  </Step>
+</Steps>
+
+## Use message state
+
+Agent-style message history uses `MessagesState` or an `Annotated[..., add_messages]` field. At join barriers, this compiles to a native message merge: messages with matching non-empty `id` values replace the existing record in place, while messages without ids append.
+
+```python
+from agentcore.graph import START, MessagesState, StateGraph
+
+
+class AgentState(MessagesState, total=False):
+    summary: str
+
+
+graph = StateGraph(AgentState, name="agent", worker_count=4)
+graph.add_fanout("fanout")
+graph.add_node("draft", lambda state, config: {
+    "messages": [{"id": "draft", "role": "assistant", "content": "draft answer"}],
+})
+graph.add_node("revise", lambda state, config: {
+    "messages": [{"id": "draft", "role": "assistant", "content": "revised answer"}],
+})
+graph.add_join("join", lambda state, config: {
+    "summary": state["messages"][-1]["content"],
+})
+graph.add_edge(START, "fanout")
+graph.add_edge("fanout", "draft")
+graph.add_edge("fanout", "revise")
+graph.add_edge(["draft", "revise"], "join")
+graph.set_finish_point("join")
+```
+
+`MessagesState` exports `messages: Annotated[list[dict], add_messages]`. The `add_messages` reducer merges by `id`, which avoids duplicating messages when branches converge.
+
+## Pause and resume
+
+Nodes can intentionally pause a run using `Command(wait=True)`. The runtime saves a resumable checkpoint, and you can restore it by checkpoint id:
+
+```python
+from agentcore.graph import Command
+
+
+def specialist(state, config):
+    if not state.get("ready", False):
+        return Command(update={"ready": True}, wait=True)
+    return {"done": True}
+
+
+compiled = graph.compile()
+paused = compiled.invoke_until_pause_with_metadata({"ready": False})
+resumed = compiled.resume_with_metadata(paused["summary"]["checkpoint_id"])
+```
+
+This is the building block for human-in-the-loop steps and external wait points.
+
+## What to read next
 
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Runtime model" icon="microchip" href="/concepts/runtime-model">
+    Understand how state patches, scheduling, checkpointing, and persistent sessions work under the hood.
+  </Card>
+  <Card title="Intelligence state" icon="brain" href="/concepts/runtime-model#intelligence-state">
+    Store tasks, claims, evidence, decisions, and memories as inspectable runtime state.
+  </Card>
+  <Card title="Context assembly" icon="magnifying-glass" href="/concepts/runtime-model#context-assembly">
+    Build deterministic, citation-bearing prompt context from messages, knowledge triples, and intelligence records.
+  </Card>
+  <Card title="MCP integration" icon="plug" href="/integrations/mcp">
+    Bridge AgentCore tools and prompts to MCP servers over stdio.
+  </Card>
 </CardGroup>
-
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>

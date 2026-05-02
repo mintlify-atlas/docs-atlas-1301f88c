@@ -1,0 +1,87 @@
+---
+title: "Design lineage: systems and research behind AgentCore"
+description: "The systems, retrieval, agent-memory, and observability ideas that shaped AgentCore's runtime model, with notes on how each maps to the implemented design."
+---
+
+AgentCore is an implementation project, not a research paper. Its design draws on graph processing, dataflow systems, event-sourced state, retrieval-augmented generation, graph-shaped retrieval, agent memory research, reactive pattern matching, and observability standards. This page records those influences so the project gives appropriate credit and so you can understand why certain runtime choices exist.
+
+<AccordionGroup>
+  <Accordion title="Execution and durable state">
+    AgentCore treats a graph run as a sequence of deterministic commits. A node observes state, returns a patch, and the runtime commits that patch before routing, checkpointing, tracing, or scheduling follow-on work.
+
+    **Pregel** — influenced the broad framing of graph computation as explicit steps over state, though AgentCore is an embedded workflow runtime rather than a distributed graph-processing system.
+
+    **The Dataflow Model / Apache Beam** — influenced the separation between durable progress, observable execution boundaries, and explicit event-time thinking.
+
+    **MapReduce** — part of the broader lineage behind using explicit associative reductions instead of ad hoc merge callbacks in hot paths.
+
+    **Event Sourcing** — related to AgentCore's patch-log and replay orientation. State transitions are inspectable through append-oriented patch records.
+
+    In AgentCore: `StatePatch` is the only mutation boundary for workflow state. Schema reducers compile to native merge rules (integer sums, min/max, boolean folds, sequence concatenation, ID-aware message merging). Checkpoints, traces, and proof digests are emitted from the same commit path. Execution profiles move durability and observability cost without changing state semantics.
+  </Accordion>
+
+  <Accordion title="Agent loops, tools, and memory">
+    AgentCore's node model is neutral about prompting strategy. It supports reasoning/action loops, tool calls, model calls, and memory records without hardcoding a planner.
+
+    **ReAct** (Yao et al., 2022) — frames language-agent behavior as interleaved reasoning and action. AgentCore represents that shape with graph nodes, explicit tool/model adapters, and state patches.
+
+    **Reflexion** (Shinn et al., 2023) — explores feedback and memory for language agents. AgentCore's tasks, claims, evidence, decisions, memories, and persistent subgraph sessions give applications structured places to store and reuse those artifacts.
+
+    In AgentCore: `runtime.intelligence` stores execution-oriented records. Persistent subgraph sessions isolate child-agent memory by `(subgraph node, session_id)`. Recorded effects and task journals keep once-only external work inside the replay model.
+  </Accordion>
+
+  <Accordion title="Retrieval, context graphs, and knowledge graphs">
+    Production agents often need more than recent chat history — they need connected evidence, claims, task state, decisions, memories, and domain triples.
+
+    **Retrieval-Augmented Generation** (Lewis et al., 2020) — motivates grounding model calls in retrieved evidence rather than relying only on parameters or chat history.
+
+    **GraphRAG** (Edge et al., 2024) — motivates graph-shaped retrieval and evidence organization for complex question answering.
+
+    **Context graphs** — describe the systems need for durable, connected context around agent decisions.
+
+    **Spreading activation** (Anderson, 1983) — an older cognitive-science model for activating related concepts in a semantic network. AgentCore's native context ranking borrows the general graph-activation intuition using deterministic integer scoring and explicit top-k pruning rather than a cognitive model.
+
+    In AgentCore: Native `KnowledgeGraphStore` carries entity/triple state through patches, checkpoints, replay, and subgraph sessions. `ContextSpec` compiles structured selectors into a native context query plan. Native context ranking builds typed adjacency across intelligence records and knowledge triples, applies deterministic activation scoring, and returns a kind-balanced top-k.
+  </Accordion>
+
+  <Accordion title="Reactive scheduling and memoization">
+    AgentCore supports reactive execution when committed knowledge or intelligence changes should schedule additional nodes, without scanning every possible watcher.
+
+    **Rete** (Forgy, 1982) — a classic pattern-matching algorithm for production systems. AgentCore does not implement Rete, but the same lesson applies: compile match structure and avoid repeated full scans when facts change.
+
+    **Incremental computation** — influenced AgentCore's conservative deterministic-node memoization seam, where declared `read_keys` drive cache validity.
+
+    In AgentCore: Knowledge and intelligence subscriptions are compiled into graph metadata. Committed deltas drive reactive frontier scheduling. Deterministic nodes declare `read_keys` so the runtime can reuse results with explicit invalidation. Context views cache compiled native ranking results until staged writes change the fingerprint.
+  </Accordion>
+
+  <Accordion title="Streaming and observability">
+    AgentCore's streaming surface derives public events from trace records instead of maintaining a separate event pipeline, keeping observability aligned with execution.
+
+    **OpenTelemetry** — provides the observability vocabulary AgentCore plugs into for spans and metrics. Passing `telemetry=True` or an `OpenTelemetryObserver` on compiled graph execution methods emits run spans, optional node spans, and run/node metrics.
+
+    **Append-oriented logging and cursor-based reads** — influence the per-run segmented trace storage and stream cursor design.
+
+    In AgentCore: Public stream events are generated from trace events. Stream events carry namespace, persistent-session, checkpoint, and branch metadata. Python stream decoration is lazy when telemetry is off, so user-facing streaming does not require materializing the full event list before yielding.
+  </Accordion>
+
+  <Accordion title="Interoperability">
+    AgentCore is designed to sit inside existing agent and tooling ecosystems rather than replace them.
+
+    **LangGraph** — made graph-shaped agent orchestration accessible and influenced the familiar `StateGraph` builder style. AgentCore generates a LangGraph-compatible surface for side-by-side evaluation, and the [migration guide](/migration/from-langgraph) covers the import-level differences.
+
+    **Model Context Protocol** — gives tools, prompts, resources, and server/client configuration a common interoperability layer. AgentCore can consume MCP servers via `register_mcp_stdio()` and expose AgentCore tools and graphs through `MCPServer`.
+
+    **NetworkX** — influenced graph-first modeling vocabulary in the Python ecosystem.
+
+    AgentCore is independent of these projects unless a specific integration or compatibility layer is explicitly documented.
+  </Accordion>
+</AccordionGroup>
+
+<CardGroup cols={2}>
+  <Card title="Runtime model" icon="microchip" href="/concepts/runtime-model">
+    How patches, scheduling, and checkpointing work in practice
+  </Card>
+  <Card title="Performance" icon="gauge-high" href="/concepts/performance">
+    Benchmark methodology and current results
+  </Card>
+</CardGroup>

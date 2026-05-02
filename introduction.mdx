@@ -1,0 +1,118 @@
+---
+title: "AgentCore: C++20 runtime for agent-graph workflows"
+description: "AgentCore is a high-performance graph execution engine for multi-agent workflows, with explicit state patches, persistent sessions, and a compact Python API."
+---
+
+AgentCore is a native C++20 execution engine for agent-graph workflows. You describe a workflow as nodes and edges, nodes return state patches, and the runtime commits those patches deterministically — driving routing, checkpointing, streaming, replay, and persistent subgraph sessions from one shared execution path.
+
+The Python API (`agentcore-graph` on PyPI) is intentionally familiar: define a `StateGraph`, add nodes and edges, compile it, and invoke it. Underneath, graph metadata, state commits, scheduling, checkpointing, intelligence records, and context assembly run through the native runtime.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install AgentCore and run your first graph in minutes
+  </Card>
+  <Card title="Runtime model" icon="microchip" href="/concepts/runtime-model">
+    Understand state patches, scheduling, and checkpointing
+  </Card>
+  <Card title="Python guide" icon="python" href="/guides/state-and-reducers">
+    Message state, reducers, subgraphs, and context assembly
+  </Card>
+  <Card title="API reference" icon="code" href="/api/stategraph">
+    Full reference for StateGraph, CompiledStateGraph, and more
+  </Card>
+</CardGroup>
+
+## Why AgentCore
+
+Many agent workflows start simple and become expensive as message history grows, branches join, tools wait, and specialist subgraphs need memory. AgentCore keeps these concerns inside one runtime model from the start:
+
+<CardGroup cols={2}>
+  <Card title="Explicit state patches" icon="layer-group">
+    Nodes return patches, not mutations. The same commit point drives trace emission, replay, and checkpointing.
+  </Card>
+  <Card title="Persistent subgraph sessions" icon="diagram-project">
+    Specialist agents maintain isolated child state across many parent invocations without shared mutable state.
+  </Card>
+  <Card title="Structured intelligence state" icon="brain">
+    Tasks, claims, evidence, decisions, and memories live inside runtime state — inspectable and replayable.
+  </Card>
+  <Card title="Context assembly" icon="magnifying-glass">
+    Native context-graph ranking assembles deterministic, citation-bearing prompt context from messages, intelligence records, and knowledge triples.
+  </Card>
+  <Card title="MCP interoperability" icon="plug">
+    Consume MCP servers and expose AgentCore tools, prompts, and graph surfaces through MCP over stdio.
+  </Card>
+  <Card title="OpenTelemetry" icon="chart-line">
+    Opt-in run spans, node spans, and metrics using the standard OpenTelemetry API.
+  </Card>
+</CardGroup>
+
+## Get started
+
+<Steps>
+  <Step title="Install AgentCore">
+    Install the published Python package from PyPI:
+    ```bash
+    pip install agentcore-graph
+    ```
+    Optional extras for OpenTelemetry and Neo4j:
+    ```bash
+    pip install "agentcore-graph[otel]"
+    pip install "agentcore-graph[neo4j]"
+    ```
+  </Step>
+  <Step title="Define a graph">
+    Create a `StateGraph`, add nodes, connect edges, and compile:
+    ```python
+    from agentcore.graph import END, START, StateGraph
+
+    def step(state, config):
+        return {"count": int(state.get("count", 0)) + 1}
+
+    def route(state, config):
+        return END if state["count"] >= 3 else "step"
+
+    graph = StateGraph(dict, name="counter", worker_count=2)
+    graph.add_node("step", step)
+    graph.add_edge(START, "step")
+    graph.add_conditional_edges("step", route, {END: END, "step": "step"})
+
+    compiled = graph.compile()
+    ```
+  </Step>
+  <Step title="Invoke and inspect">
+    Run the graph and examine results:
+    ```python
+    final_state = compiled.invoke({"count": 0})
+    print(final_state["count"])  # 3
+
+    # Or get full run metadata
+    details = compiled.invoke_with_metadata({"count": 0})
+    print(details["checkpoints"])
+    ```
+  </Step>
+  <Step title="Add tools, models, and integrations">
+    Register adapters, connect MCP servers, enable observability:
+    ```python
+    compiled.tools.register_mcp_stdio(["python3", "./my_mcp_server.py"], prefix="remote")
+    compiled.models.register_openai_chat("gpt4", provider_model_name="gpt-4o")
+    ```
+  </Step>
+</Steps>
+
+## Explore the docs
+
+<CardGroup cols={2}>
+  <Card title="Guides" icon="book-open" href="/guides/state-and-reducers">
+    State reducers, subgraph sessions, context assembly, intelligence state, and higher-level patterns
+  </Card>
+  <Card title="Integrations" icon="arrows-turn-to-dots" href="/integrations/mcp">
+    MCP, Neo4j graph stores, and OpenTelemetry observability
+  </Card>
+  <Card title="Migration from LangGraph" icon="code-compare" href="/migration/from-langgraph">
+    Move existing LangGraph code to AgentCore with minimal changes
+  </Card>
+  <Card title="C++ embedding" icon="file-code" href="/api/cpp-overview">
+    Embed the native runtime in C++ applications
+  </Card>
+</CardGroup>

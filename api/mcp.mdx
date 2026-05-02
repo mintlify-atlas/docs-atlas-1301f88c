@@ -1,0 +1,483 @@
+---
+title: "MCP client and server API reference"
+description: "Complete reference for AgentCore's MCP bridge, covering StdioMCPClient, MCPServer, MCPServerSession, launcher commands, and exported protocol helpers."
+---
+
+`agentcore.mcp` provides a full Model Context Protocol bridge. `StdioMCPClient` connects to any MCP server over `stdio`. `MCPServer` builds a Python-backed MCP server that exposes tools, prompts, and resources to any MCP-compatible client. Launchers and protocol helpers round out the module.
+
+```python
+from agentcore import mcp
+from agentcore.mcp import StdioMCPClient, MCPServer, MCPServerSession
+```
+
+<AccordionGroup>
+
+  <Accordion title="StdioMCPClient">
+
+## `StdioMCPClient`
+
+```python
+client = StdioMCPClient(
+    command,
+    *,
+    cwd=None,
+    env=None,
+    startup_timeout=10.0,
+    request_timeout=30.0,
+    client_name="agentcore",
+    client_version="0.1",
+    roots=None,
+    roots_list_changed=True,
+    sampling_handler=None,
+    elicitation_handler=None,
+    log_handler=None,
+    notification_handler=None,
+)
+```
+
+Launches a child MCP server process and communicates over newline-delimited JSON-RPC on `stdio`.
+
+<ParamField path="command" type="str | list[str]">
+  Command to launch the MCP server. Pass a list for commands with arguments.
+</ParamField>
+
+<ParamField path="cwd" type="str | None" default="None">
+  Working directory for the server process.
+</ParamField>
+
+<ParamField path="env" type="dict | None" default="None">
+  Environment variables for the server process. Merged with the current environment.
+</ParamField>
+
+<ParamField path="startup_timeout" type="float" default="10.0">
+  Seconds to wait for the server to complete MCP `initialize` handshake.
+</ParamField>
+
+<ParamField path="request_timeout" type="float" default="30.0">
+  Default per-request timeout in seconds.
+</ParamField>
+
+<ParamField path="client_name" type="str" default='"agentcore"'>
+  Client name advertised during MCP `initialize`.
+</ParamField>
+
+<ParamField path="client_version" type="str" default='"0.1"'>
+  Client version advertised during MCP `initialize`.
+</ParamField>
+
+<ParamField path="roots" type="list | None" default="None">
+  Initial root URIs advertised to the server.
+</ParamField>
+
+<ParamField path="roots_list_changed" type="bool" default="true">
+  Whether the client advertises the `roots/listChanged` capability.
+</ParamField>
+
+<ParamField path="sampling_handler" type="callable | None" default="None">
+  Callback invoked when the server issues a `sampling/createMessage` request.
+</ParamField>
+
+<ParamField path="elicitation_handler" type="callable | None" default="None">
+  Callback invoked when the server issues an `elicitation/create` request.
+</ParamField>
+
+<ParamField path="log_handler" type="callable | None" default="None">
+  Callback invoked for server log notifications.
+</ParamField>
+
+<ParamField path="notification_handler" type="callable | None" default="None">
+  Callback invoked for all other server notifications.
+</ParamField>
+
+### Lifecycle
+
+```python
+client.start()
+# ... use the client ...
+client.close()
+```
+
+Call `.start()` before any other method. Optional capabilities registered before `.start()` are advertised during `initialize`.
+
+### Tool methods
+
+```python
+tools  = client.list_tools()
+result = client.call_tool(name, arguments=None, *, timeout=None, result_mode="auto")
+raw    = client.call_tool_raw(name, arguments=None, *, timeout=None)
+```
+
+`call_tool(..., result_mode="auto")` normalizes successful structured/text results. When the upstream tool reports `isError=true`, the raw MCP result envelope is returned instead.
+
+### Prompt methods
+
+```python
+prompts = client.list_prompts()
+prompt  = client.get_prompt(name, arguments=None, *, timeout=None)
+raw     = client.get_prompt_raw(name, arguments=None, *, timeout=None)
+```
+
+`get_prompt(...)` returns a `RenderedMCPPrompt`. Pass it directly to `runtime.invoke_model` or any model invocation surface.
+
+### Resource methods
+
+```python
+resources  = client.list_resources()
+templates  = client.list_resource_templates()
+content    = client.read_resource(uri, *, timeout=None, decode="auto")
+raw        = client.read_resource_raw(uri, *, timeout=None)
+client.subscribe_resource(uri, *, timeout=None)
+client.unsubscribe_resource(uri, *, timeout=None)
+```
+
+### Completion
+
+```python
+values = client.complete(ref, argument_name, value, *, arguments=None, timeout=None)
+values = client.complete_prompt_argument(prompt_name, argument_name, value, ...)
+values = client.complete_resource_argument(uri_template, argument_name, value, ...)
+```
+
+### Roots and handlers
+
+```python
+roots = client.list_roots()
+client.set_roots(roots, *, notify=True)
+client.set_sampling_handler(handler)
+client.set_elicitation_handler(handler)
+client.set_log_handler(handler)
+client.set_notification_handler(handler)
+```
+
+### Notifications and logging
+
+```python
+client.set_logging_level(level, *, timeout=None)
+notifications    = client.drain_notifications()
+logs             = client.drain_logs()
+resource_updates = client.drain_resource_updates()
+```
+
+### Properties
+
+| Property | Type | Description |
+|---|---|---|
+| `.server_info` | `dict` | Server name and version from `initialize`. |
+| `.server_capabilities` | `dict` | Capabilities advertised by the server. |
+| `.protocol_version` | `str` | Negotiated MCP protocol version. |
+| `.list_change_counts` | `dict` | Per-list notification counts since last drain. |
+| `.resource_subscriptions` | `set[str]` | Currently subscribed resource URIs. |
+
+  </Accordion>
+
+  <Accordion title="MCPServer">
+
+## `MCPServer`
+
+```python
+server = MCPServer(
+    *,
+    name="agentcore-mcp",
+    version="0.1",
+    instructions="",
+    request_timeout=30.0,
+    enable_logging=True,
+    resource_subscriptions_enabled=True,
+    list_changed_notifications_enabled=True,
+    auto_notify_catalog_changes=True,
+)
+```
+
+Builds a Python-backed MCP server that implements the full MCP protocol over `stdio`.
+
+<ParamField path="name" type="str" default='"agentcore-mcp"'>
+  Server name advertised during `initialize`.
+</ParamField>
+
+<ParamField path="version" type="str" default='"0.1"'>
+  Server version advertised during `initialize`.
+</ParamField>
+
+<ParamField path="instructions" type="str" default='""'>
+  Human-readable server instructions sent during `initialize`.
+</ParamField>
+
+<ParamField path="request_timeout" type="float" default="30.0">
+  Per-request timeout in seconds.
+</ParamField>
+
+<ParamField path="enable_logging" type="bool" default="true">
+  Whether the server advertises and handles the `logging/setLevel` capability.
+</ParamField>
+
+<ParamField path="resource_subscriptions_enabled" type="bool" default="true">
+  Whether resource subscription notifications are enabled.
+</ParamField>
+
+<ParamField path="list_changed_notifications_enabled" type="bool" default="true">
+  Whether list-changed notifications are enabled.
+</ParamField>
+
+<ParamField path="auto_notify_catalog_changes" type="bool" default="true">
+  When `True`, catalog mutations (tool/prompt/resource registration) automatically emit list-changed notifications.
+</ParamField>
+
+### Class methods
+
+```python
+server = MCPServer.from_tool_registry(
+    tool_registry,
+    *, name="agentcore-tools", version="0.1",
+    descriptions=None, input_schemas=None,
+)
+server = MCPServer.from_compiled_graph(
+    compiled_graph,
+    *, name="agentcore-tools", version="0.1",
+    descriptions=None, input_schemas=None,
+)
+```
+
+### Tool methods
+
+```python
+server.add_tool(name, handler, *, description="", input_schema=None, title="", annotations=None)
+
+@server.tool(name=None, *, description="", input_schema=None, title="", annotations=None)
+def my_tool(arguments, metadata):
+    return {"result": "done"}
+
+tools  = server.list_tools()
+result = server.call_tool(name, arguments=None)
+```
+
+### Prompt methods
+
+```python
+server.add_prompt(name, handler, *, description="", arguments=None, title="", argument_completions=None)
+server.add_prompt_template(name, template, *, description="", arguments=None, title="", argument_completions=None)
+
+@server.prompt(name=None, *, description="", arguments=None, title="", argument_completions=None)
+def my_prompt(arguments, metadata):
+    return [{"role": "user", "content": {"type": "text", "text": "Hello"}}]
+
+prompts = server.list_prompts()
+result  = server.get_prompt(name, arguments=None)
+```
+
+### Resource methods
+
+```python
+server.add_resource(uri, handler, *, name="", description="", mime_type="", size=None, annotations=None)
+server.add_resource_template(
+    uri_template, handler,
+    *, name="", description="", mime_type="", annotations=None, argument_completions=None,
+)
+
+@server.resource_template(uri_template=None, ...)
+def my_resource(uri, metadata):
+    return "resource content"
+
+resources = server.list_resources()
+content   = server.read_resource(uri)
+templates = server.list_resource_templates()
+values    = server.complete(ref, argument_name, value, *, arguments=None)
+```
+
+### Client-facing request methods
+
+```python
+roots    = server.list_client_roots(*, timeout=None)
+response = server.sample(
+    messages,
+    *, model_preferences=None, system_prompt=None, include_context=None,
+    temperature=None, max_tokens=None, stop_sequences=None,
+    metadata=None, timeout=None,
+)
+response = server.elicit(message, requested_schema, *, timeout=None)
+```
+
+### Notifications and logging
+
+```python
+server.log(level, data, *, logger=None)
+server.notify_tools_changed()
+server.notify_prompts_changed()
+server.notify_resources_changed()
+server.notify_resource_updated(uri)
+```
+
+### Session access
+
+```python
+session = server.current_session()  # returns MCPServerSession or None
+```
+
+### Serving
+
+```python
+server.serve_stdio(...)
+server.run_stdio()
+```
+
+The server implements MCP `initialize`, `ping`, `tools/list`, `tools/call`, `prompts/list`, `prompts/get`, `resources/list`, `resources/templates/list`, `resources/read`, `resources/subscribe`, `resources/unsubscribe`, `completion/complete`, `logging/setLevel`, and the client-facing surfaces `roots/list`, `sampling/createMessage`, and `elicitation/create` over newline-delimited JSON-RPC on `stdio`.
+
+When a handler accepts a `metadata` argument, the active session is injected under both `metadata["session"]` and `metadata["mcp"]`.
+
+  </Accordion>
+
+  <Accordion title="MCPServerSession">
+
+## `MCPServerSession`
+
+`MCPServerSession` is injected into server handlers via `metadata["session"]` and is also available through `server.current_session()`.
+
+### Properties
+
+| Property | Type | Description |
+|---|---|---|
+| `.client_capabilities` | `dict` | Capabilities advertised by the connected client. |
+| `.client_info` | `dict` | Client name and version from `initialize`. |
+| `.logging_level` | `str` | Current logging level set by the client. |
+| `.initialized` | `bool` | Whether the MCP handshake has completed. |
+| `.roots_change_count` | `int` | Number of roots-changed notifications received. |
+| `.subscribed_resources` | `set[str]` | Currently subscribed resource URIs. |
+
+### Methods
+
+```python
+roots    = session.list_roots(*, timeout=None)
+response = session.sample(messages, *, model_preferences=None, system_prompt=None, ...)
+response = session.elicit(message, requested_schema, *, timeout=None)
+session.send_log(level, data, *, logger=None)
+session.notify_tools_changed()
+session.notify_prompts_changed()
+session.notify_resources_changed()
+session.notify_resource_updated(uri)
+subscribed = session.is_resource_subscribed(uri)
+```
+
+<Note>
+  `MCPToolServer` is available as a compatibility alias for `MCPServer`, retained for code that used the earlier, tool-only surface.
+</Note>
+
+  </Accordion>
+
+  <Accordion title="Launcher helpers">
+
+## Launcher helpers
+
+The published package installs three entry points:
+
+```bash
+agentcore-mcp          # serve command
+agentcore-mcp-server   # serve command (alias)
+agentcore-mcp-config   # config generation command
+```
+
+The module can also be invoked directly:
+
+```bash
+python -m agentcore.mcp serve --target package.module:build_server
+python -m agentcore.mcp config codex --name local-agentcore --target package.module:build_server
+```
+
+### Accepted launcher targets
+
+- `package.module:server` — a module-level `MCPServer` instance
+- `package.module:build_server` — a zero-argument factory returning `MCPServer`
+- `./local_server.py:server` — a file-relative `MCPServer` instance
+- `./local_server.py:create_server` — a file-relative zero-argument factory
+
+Resolved targets may be an `MCPServer`, a zero-argument factory, a `CompiledStateGraph`, a `StateGraph`, or a tool registry compatible with `MCPServer.from_tool_registry`.
+
+### Exported helper functions
+
+```python
+from agentcore.mcp import (
+    load_target_object,
+    resolve_server_target,
+    run_stdio_server,
+    render_client_config,
+    serve_main,
+    config_main,
+)
+```
+
+| Function | Description |
+|---|---|
+| `load_target_object(target)` | Imports and returns the Python object at the given `module:attribute` or `file:attribute` target path. |
+| `resolve_server_target(target, *, name=None, version=None, instructions=None)` | Resolves a target to an `MCPServer`, calling factory functions as needed. |
+| `run_stdio_server(target, *, name=None, version=None, instructions=None)` | Resolves a target and starts serving over `stdio`. Blocks until the client disconnects. |
+| `render_client_config(client, *, server_name, target, python_executable=None, env=None, cwd=None, gemini_scope="project")` | Renders a client configuration snippet for the named MCP client (e.g., `"codex"`, `"claude"`). |
+| `serve_main(argv=None)` | Entry point for the `agentcore-mcp serve` command. |
+| `config_main(argv=None)` | Entry point for the `agentcore-mcp config` command. |
+
+  </Accordion>
+
+</AccordionGroup>
+
+## Code examples
+
+<CodeGroup>
+
+```python StdioMCPClient usage
+from agentcore.mcp import StdioMCPClient
+
+client = StdioMCPClient(["python", "-m", "my_mcp_server"])
+client.start()
+
+tools = client.list_tools()
+result = client.call_tool("search", {"query": "AgentCore"})
+prompt = client.get_prompt("summarize", {"topic": "AI"})
+
+client.close()
+```
+
+```python MCPServer with tools and prompts
+from agentcore.mcp import MCPServer
+
+server = MCPServer(name="my-server", version="1.0")
+
+@server.tool(description="Echo the input text")
+def echo(arguments, metadata):
+    return {"text": arguments.get("text", "")}
+
+@server.prompt(description="Generate a greeting")
+def greet(arguments, metadata):
+    name = arguments.get("name", "World")
+    return [{"role": "user", "content": {"type": "text", "text": f"Hello, {name}!"}}]
+
+server.run_stdio()
+```
+
+```python MCPServer from a compiled graph
+from agentcore import StateGraph, START, END
+from agentcore.mcp import MCPServer
+
+graph = StateGraph()
+graph.add_node("step", lambda s: {"result": s.get("input", "")})
+graph.add_edge(START, "step")
+graph.add_edge("step", END)
+compiled = graph.compile()
+compiled.tools.register("greet", lambda req: f"Hello, {req}!")
+
+server = MCPServer.from_compiled_graph(compiled, name="graph-server")
+server.run_stdio()
+```
+
+```python Register MCP tools into a graph
+from agentcore import StateGraph, START, END
+
+graph = StateGraph()
+compiled = graph.add_node("step", lambda s, c, r: {"out": r.invoke_tool("search", s["q"])}).compile()
+
+compiled.tools.register_mcp_stdio(
+    ["npx", "my-search-server"],
+    prefix="search",
+    startup_timeout=15.0,
+)
+
+result = compiled.invoke({"q": "hello"})
+```
+
+</CodeGroup>

@@ -1,0 +1,281 @@
+---
+title: "CompiledStateGraph API reference"
+description: "Complete reference for CompiledStateGraph invocation, streaming, batch, pause and resume, run metadata fields, and tool, model, and graph-store registries."
+---
+
+`CompiledStateGraph` is the executable form of a `StateGraph`. You obtain it by calling `graph.compile()` and never instantiate it directly. It exposes synchronous and asynchronous invocation, event streaming, batch execution, pause-and-resume workflows, and access to the graph-owned tool, model, and graph-store registries.
+
+## Execution methods
+
+### `invoke`
+
+```python
+state = compiled.invoke(input_state=None, *, config=None, telemetry=None)
+```
+
+Runs the graph to completion and returns the final state dictionary.
+
+<ParamField path="input_state" type="dict | None" default="None">
+  Initial state fields. `None` is equivalent to `{}`.
+</ParamField>
+
+<ParamField path="config" type="dict | None" default="None">
+  Runtime configuration passed to every node callback. Available inside callbacks as the second positional argument.
+</ParamField>
+
+<ParamField path="telemetry" type="bool | OpenTelemetryObserver | None" default="None">
+  Pass `True` to construct a default `OpenTelemetryObserver`. Pass an explicit `OpenTelemetryObserver` instance for custom tracer/meter injection. `None` or `False` disables telemetry.
+</ParamField>
+
+### `invoke_with_metadata`
+
+```python
+details = compiled.invoke_with_metadata(
+    input_state=None,
+    *,
+    config=None,
+    include_subgraphs=True,
+    telemetry=None,
+)
+```
+
+Runs the graph to completion and returns a full run-details dictionary. The `details["state"]` key holds the final state. See [metadata shape](#metadata-shape) below for all fields.
+
+<ParamField path="include_subgraphs" type="bool" default="true">
+  When `True`, per-node metadata for subgraph runs is included alongside top-level node metadata.
+</ParamField>
+
+### `invoke_until_pause_with_metadata`
+
+```python
+details = compiled.invoke_until_pause_with_metadata(
+    input_state=None,
+    *,
+    config=None,
+    include_subgraphs=True,
+    telemetry=None,
+)
+```
+
+Runs the graph until a node with `stop_after=True` (or `kind="human"`) pauses execution, then returns metadata including the `checkpoint_id` needed to resume. Use `details["checkpoint_id"]` with `resume_with_metadata` to continue.
+
+### `resume_with_metadata`
+
+```python
+details = compiled.resume_with_metadata(
+    checkpoint_id,
+    *,
+    include_subgraphs=True,
+    telemetry=None,
+)
+```
+
+Resumes a paused run from the given checkpoint and returns the final run-details dictionary.
+
+<ParamField path="checkpoint_id" type="int">
+  The numeric checkpoint ID from a previous `invoke_until_pause_with_metadata` result.
+</ParamField>
+
+### `stream`
+
+```python
+for event in compiled.stream(
+    input_state=None,
+    *,
+    config=None,
+    include_subgraphs=True,
+    stream_mode="events",
+    telemetry=None,
+):
+    ...
+```
+
+Yields per-node event dictionaries as the graph executes. Each event carries the same metadata fields as run-level metadata. Only `stream_mode="events"` is currently supported.
+
+<ParamField path="stream_mode" type="str" default="events">
+  Stream event format. Only `"events"` is supported.
+</ParamField>
+
+### Async methods
+
+```python
+# Async variants — same parameters as their sync counterparts
+state   = await compiled.ainvoke(input_state, *, config, telemetry)
+details = await compiled.ainvoke_with_metadata(input_state, *, config, include_subgraphs, telemetry)
+
+async for event in compiled.astream(input_state, *, config, include_subgraphs, stream_mode, telemetry):
+    ...
+```
+
+All async methods delegate to their sync equivalents via `asyncio.to_thread`. `astream` collects events in a thread and re-yields them from the async generator.
+
+### `batch`
+
+```python
+results = compiled.batch(inputs, *, config=None, telemetry=None)
+```
+
+Runs `invoke` sequentially for each input in `inputs` and returns a list of final states. `config` may be a single dict (shared across all inputs) or a list with one entry per input.
+
+### `abatch`
+
+```python
+results = await compiled.abatch(inputs, *, config=None, telemetry=None)
+```
+
+Async variant of `batch`. Creates one `ainvoke` task per input and awaits them concurrently.
+
+## Metadata shape
+
+`invoke_with_metadata`, `invoke_until_pause_with_metadata`, `resume_with_metadata`, and each `stream` event include the following metadata fields:
+
+| Field | Description |
+|---|---|
+| `sequence` | Monotonically increasing execution order counter. |
+| `graph_id` | Stable identifier for the compiled graph. |
+| `node_id` | Identifier for the executed node. |
+| `branch_id` | Fan-out branch identifier; `None` for sequential nodes. |
+| `checkpoint_id` | Numeric ID for the resulting checkpoint. Required for `resume_with_metadata`. |
+| `node_kind` | The kind string for the executed node (`compute`, `aggregate`, etc.). |
+| `result` | The state updates returned by this node. |
+| `ts_start_ns` | Wall-clock start time in nanoseconds. |
+| `ts_end_ns` | Wall-clock end time in nanoseconds. |
+| `duration_ns` | Execution duration in nanoseconds. |
+| `confidence` | Confidence value emitted by the node, if any. |
+| `patch_count` | Number of state field patches applied by this node. |
+| `flags` | Bitmask of native result flags for this node execution. |
+| `session_id` | Subgraph session ID, if this node is a subgraph with a persistent session. |
+| `session_revision` | Revision counter for the subgraph session. |
+| `namespaces` | List of namespace strings scoping this node's state. |
+
+`invoke_with_metadata`, `invoke_until_pause_with_metadata`, and `resume_with_metadata` also include the committed intelligence snapshot under `details["intelligence"]`.
+
+## Registry properties
+
+`CompiledStateGraph` exposes three graph-owned native registries as read-only properties.
+
+### `compiled.tools` — `ToolRegistryView`
+
+<AccordionGroup>
+  <Accordion title="Inspection">
+    - `compiled.tools.list()` — returns registered tool names
+    - `compiled.tools.describe(name)` — returns adapter metadata for a tool
+  </Accordion>
+  <Accordion title="Registration">
+    - `compiled.tools.register(name, handler, *, policy=None, metadata=None, decode_input="auto")`
+    - `compiled.tools.register_http(name="http_tool", *, policy=None, enable_mock_scheme=True, enable_file_scheme=True)`
+    - `compiled.tools.register_sqlite(name="sqlite_tool", *, policy=None)`
+    - `compiled.tools.register_http_json(name="http_json_tool", *, policy=None, transport=None, default_method="POST")`
+    - `compiled.tools.register_mcp_stdio(command, *, prefix=None, include=None, exclude=None, env=None, cwd=None, startup_timeout=10.0, request_timeout=30.0, tool_timeout=None, result_mode="auto", argument_key=None)` — mirrors MCP server tools into the graph-owned registry; imported tools are invoked through the standard `runtime.invoke_tool(...)` path
+  </Accordion>
+  <Accordion title="Invocation">
+    - `compiled.tools.invoke(name, request, *, decode="auto")` — returns the decoded output
+    - `compiled.tools.invoke_with_metadata(name, request, *, decode="auto")` — returns full invocation details
+
+    **Invocation details fields:** `ok`, `output`, `flags`, `attempts`, `latency_ns`, `error_category`
+  </Accordion>
+</AccordionGroup>
+
+### `compiled.models` — `ModelRegistryView`
+
+<AccordionGroup>
+  <Accordion title="Inspection">
+    - `compiled.models.list()` — returns registered model names
+    - `compiled.models.describe(name)` — returns adapter metadata for a model
+  </Accordion>
+  <Accordion title="Registration">
+    - `compiled.models.register(name, handler, *, policy=None, metadata=None, decode_prompt="auto", decode_schema="auto")`
+    - `compiled.models.register_local(name="local_model", *, policy=None, default_max_tokens=256)`
+    - `compiled.models.register_llm_http(name="llm_http", *, policy=None, enable_mock_transport=True)`
+    - `compiled.models.register_openai_chat(name="openai_chat", *, policy=None, transport=None, provider_model_name="", endpoint_path="/chat/completions", system_prompt="", include_json_schema=True)`
+    - `compiled.models.register_grok_chat(name="grok_chat", *, policy=None, transport=None, provider_model_name="", endpoint_path="/chat/completions", system_prompt="", include_json_schema=True)`
+    - `compiled.models.register_gemini_generate_content(name="gemini", *, policy=None, transport=None, provider_model_name="", endpoint_path="", system_prompt="")`
+  </Accordion>
+  <Accordion title="Invocation">
+    - `compiled.models.invoke(name, prompt, *, schema=None, max_tokens=0, decode="auto")` — returns the decoded output
+    - `compiled.models.invoke_with_metadata(name, prompt, *, schema=None, max_tokens=0, decode="auto")` — returns full invocation details
+
+    `prompt` accepts the same rendered prompt objects supported by `RuntimeContext.invoke_model`. `schema` may also be a prompt object.
+
+    **Invocation details fields:** `ok`, `output`, `flags`, `attempts`, `latency_ns`, `error_category`, `confidence`, `token_usage`
+  </Accordion>
+</AccordionGroup>
+
+### `compiled.graph_stores` — `GraphStoreRegistryView`
+
+<AccordionGroup>
+  <Accordion title="Registration and access">
+    - `compiled.graph_stores.list()` — returns registered store names
+    - `compiled.graph_stores.get(name)` — returns a registered store instance
+    - `compiled.graph_stores.register(name, store)` — registers a custom `GraphStore`
+    - `compiled.graph_stores.register_memory(name="memory", *, entities=None, triples=None)` — in-memory store; deterministic and suited for tests
+    - `compiled.graph_stores.register_neo4j(name="neo4j", *, uri=None, auth=None, database=None, driver=None, from_env=False)` — requires `pip install "agentcore-graph[neo4j]"`
+    - `compiled.graph_stores.remove(name, *, close=False)` — removes a store, optionally closing it
+    - `compiled.graph_stores.close_all()` — closes all registered stores
+  </Accordion>
+</AccordionGroup>
+
+## Code examples
+
+<CodeGroup>
+
+```python Basic invocation
+from agentcore.graph import StateGraph, START, END
+
+graph = StateGraph(dict, name="demo")
+graph.add_node("step", lambda s: {"done": True})
+graph.add_edge(START, "step")
+graph.add_edge("step", END)
+
+compiled = graph.compile()
+state = compiled.invoke({"input": "hello"})
+print(state["done"])  # True
+```
+
+```python Metadata and checkpoint
+compiled = graph.compile()
+
+# Run until the first human node pauses execution
+details = compiled.invoke_until_pause_with_metadata({"query": "hello"})
+checkpoint_id = details["checkpoint_id"]
+
+# After human review, resume
+final = compiled.resume_with_metadata(checkpoint_id)
+print(final["state"])
+```
+
+```python Streaming events
+compiled = graph.compile()
+
+for event in compiled.stream({"text": "run"}, include_subgraphs=True):
+    print(event["node_id"], event["duration_ns"])
+```
+
+```python Registering a model and running async
+import asyncio
+from agentcore import StateGraph, START, END
+
+compiled = StateGraph().add_node("call", lambda s, c, r: {"reply": r.invoke_model("chat", s["prompt"])}).compile()
+compiled.models.register_openai_chat(
+    name="chat",
+    provider_model_name="gpt-4o",
+)
+
+async def main():
+    result = await compiled.ainvoke({"prompt": "Say hello."})
+    print(result["reply"])
+
+asyncio.run(main())
+```
+
+```python Batch execution
+from agentcore import StateGraph, START, END
+
+compiled = graph.compile()
+inputs = [{"n": 1}, {"n": 2}, {"n": 3}]
+results = compiled.batch(inputs)
+for r in results:
+    print(r)
+```
+
+</CodeGroup>

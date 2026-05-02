@@ -1,0 +1,264 @@
+---
+title: "Graph store backends for AgentCore"
+description: "Hydrate external graph data into runtime knowledge, sync back to Neo4j or in-memory stores, and implement custom graph store backends."
+---
+
+AgentCore has a native in-process knowledge graph for execution-time decisions, context assembly, and checkpoints. The graph-store layer is separate: it connects to data that lives outside the runtime, such as Neo4j or a test fixture, and makes that data available to nodes through explicit hydration. A node decides what to load; the loaded triples become ordinary `runtime.knowledge` writes for that step. Nothing is automatically merged into runtime state.
+
+## When to use graph stores
+
+Use the graph-store layer when:
+
+- your source of truth for entities and relationships lives in a graph database
+- a node needs a bounded neighborhood as prompt or decision context
+- tests need deterministic graph-shaped fixtures without running a database
+- a workflow should write selected runtime knowledge back to an external graph
+
+Keep `runtime.knowledge` as the execution-time graph. Keep Neo4j or another graph database as the external system of record when you need durability, offline graph exploration, or access from other services.
+
+## In-memory store
+
+`InMemoryGraphStore` is deterministic and requires no external process. It accepts tuples, mappings, or `GraphTriple` values directly at registration time, making it the right choice for tests and local development.
+
+```python
+from agentcore.graph import END, START, StateGraph
+
+
+def load_context(state, config, runtime):
+    loaded = runtime.knowledge.load_neighborhood(
+        "Incident",
+        store="ops_graph",
+        depth=2,
+        limit=20,
+    )
+    return {"loaded_triples": len(loaded["triples"])}
+
+
+graph = StateGraph(dict, name="graph_store_demo")
+graph.add_node("load", load_context)
+graph.add_edge(START, "load")
+graph.add_edge("load", END)
+
+compiled = graph.compile()
+compiled.graph_stores.register_memory(
+    "ops_graph",
+    triples=[
+        ("Incident", "affects", "checkout API"),
+        ("checkout API", "depends_on", "payment service"),
+    ],
+)
+
+result = compiled.invoke({})
+```
+
+The store registry is graph-owned. For `StateGraph` subgraphs compiled as part of the parent graph, the same registry is available inside child callbacks. If you pass an already-compiled child graph, register graph stores on that compiled child if its callbacks need direct access.
+
+## Neo4j store
+
+<Note>
+`Neo4jGraphStore` requires the optional `neo4j` extra. Install it with `pip install "agentcore-graph[neo4j]"` before registering a Neo4j-backed store.
+</Note>
+
+### Register by connection parameters
+
+```python
+compiled.graph_stores.register_neo4j(
+    "ops_graph",
+    uri="bolt://localhost:7687",
+    auth=("neo4j", "password"),
+)
+```
+
+### Register from environment variables
+
+`from_env=True` reads `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, and `NEO4J_DATABASE`:
+
+```python
+compiled.graph_stores.register_neo4j("ops_graph", from_env=True)
+```
+
+### Neo4j schema conventions
+
+The adapter uses a fixed schema so domain relation names stay parameterized rather than interpolated into Cypher syntax:
+
+| Item | Value |
+|---|---|
+| Node label | `AgentCoreEntity` |
+| Node key property | `agentcore_id` |
+| Relationship type | `AGENTCORE_RELATION` |
+| Relation name storage | `relation` property on the relationship |
+
+Domain relation names such as `"affects"` or `"depends_on"` are stored as data on `AGENTCORE_RELATION` relationships. This keeps the adapter portable across domain schemas and avoids interpolating arbitrary strings into Cypher.
+
+### Using Neo4j inside a graph node
+
+```python
+def load_from_neo4j(state, config, runtime):
+    loaded = runtime.knowledge.load_neighborhood(
+        state["entity"],
+        store="ops_graph",
+        depth=2,
+        limit=50,
+    )
+    return {"neighbors": loaded["triples"]}
+```
+
+## Runtime API
+
+### Inside node callbacks
+
+```python
+# Load an entity neighborhood from an external store into runtime knowledge
+runtime.knowledge.load_neighborhood(
+    entity=None,
+    *,
+    store,
+    subject=None,
+    relation=None,
+    depth=1,
+    limit=None,
+    properties=None,
+)
+
+# Load matching triples from an external store into runtime knowledge
+runtime.knowledge.load_query(
+    store,
+    subject=None,
+    relation=None,
+    object=None,
+    direction="match",
+    depth=1,
+    limit=None,
+    properties=None,
+)
+
+# Write selected runtime knowledge triples back to an external store
+runtime.knowledge.sync_to_store(
+    store,
+    *,
+    subject=None,
+    relation=None,
+    object=None,
+    direction="match",
+    limit=None,
+)
+
+# Access the store registry directly
+runtime.graph_stores.list()
+runtime.graph_stores.get(name)
+```
+
+Both `load_neighborhood(...)` and `load_query(...)` stage returned entities and triples into native runtime knowledge and return a dictionary with `entities`, `triples`, optional `store`, optional `subject`, and optional `metadata`. `sync_to_store(...)` queries native runtime knowledge and writes the selected triples into the named external store.
+
+### On a compiled graph
+
+```python
+compiled.graph_stores.register(name, store)
+compiled.graph_stores.register_memory(name="memory", *, entities=None, triples=None)
+compiled.graph_stores.register_neo4j(
+    name="neo4j",
+    *,
+    uri=None,
+    auth=None,
+    database=None,
+    driver=None,
+    from_env=False,
+)
+compiled.graph_stores.get(name)
+compiled.graph_stores.list()
+compiled.graph_stores.remove(name, close=False)
+compiled.graph_stores.close_all()
+```
+
+## Graph store value types
+
+These types are imported from `agentcore.graphstores`:
+
+```python
+from agentcore.graphstores import (
+    GraphEntity,
+    GraphTriple,
+    GraphNeighborhood,
+    GraphQuery,
+    GraphStore,
+    InMemoryGraphStore,
+    Neo4jGraphStore,
+)
+```
+
+### `GraphEntity`
+
+```python
+GraphEntity(label, payload=None, properties=None)
+```
+
+Represents a graph node. `label` is a non-empty string. `payload` is an arbitrary Python object. `properties` is a string-keyed mapping. Tuple and mapping forms are also accepted by `register_memory(...)` and the store interface.
+
+### `GraphTriple`
+
+```python
+GraphTriple(subject, relation, object, payload=None, properties=None)
+```
+
+Represents a directed edge between two entity labels. All three positional arguments must be non-empty strings. Three- or four-element tuples and mappings with `subject`, `relation`, and `object` keys are also accepted.
+
+### `GraphNeighborhood`
+
+```python
+GraphNeighborhood(entities=(), triples=(), store=None, subject=None, metadata=None)
+```
+
+Returned by `load_neighborhood(...)` and `load_query(...)`. Contains the loaded entities and triples plus optional provenance metadata.
+
+### `GraphQuery`
+
+```python
+GraphQuery(
+    subject=None,
+    relation=None,
+    object=None,
+    direction="match",
+    depth=1,
+    limit=None,
+    properties=None,
+)
+```
+
+Describes a query against a graph store backend. Valid `direction` values: `"match"`, `"outgoing"`, `"incoming"`, `"both"`, `"neighborhood"`.
+
+## Custom backends
+
+Implement the `GraphStore` interface from `agentcore.graphstores`:
+
+```python
+from agentcore.graphstores import GraphNeighborhood, GraphStore
+
+
+class MyGraphStore(GraphStore):
+    def upsert_entities(self, entities):
+        ...
+
+    def upsert_triples(self, triples):
+        ...
+
+    def query(
+        self,
+        *,
+        subject=None,
+        relation=None,
+        object=None,
+        direction="match",
+        depth=1,
+        limit=None,
+        properties=None,
+    ):
+        return GraphNeighborhood(...)
+```
+
+Register the instance on the compiled graph:
+
+```python
+compiled.graph_stores.register("my_graph", MyGraphStore())
+```
+
+A backend can translate the entities, triples, and neighborhoods contract into Cypher, Gremlin, SQL, a graph-vector index, a local file, or a service call. The runtime only calls `upsert_entities(...)`, `upsert_triples(...)`, and `query(...)`.

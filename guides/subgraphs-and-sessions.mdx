@@ -1,0 +1,211 @@
+---
+title: "Subgraphs and persistent sessions in AgentCore"
+description: "Compose child graphs with add_subgraph, choose ephemeral or persistent session modes, and isolate child state across concurrent session IDs."
+---
+
+Subgraphs let you embed one compiled graph as a node inside a parent graph. The native runtime executes the child graph with its own state, routing, checkpoints, intelligence records, and knowledge graph. Stream events from child runs carry namespace frames so parent and child paths remain distinguishable.
+
+## Adding a subgraph
+
+Use `add_subgraph(...)` to register a child graph as a node. Explicit `inputs` and `outputs` bindings map parent state field names to child state field names.
+
+```python
+from agentcore.graph import END, START, StateGraph
+
+
+specialist = StateGraph(dict, name="specialist", worker_count=2)
+specialist.add_node("answer", lambda state, config: {
+    "visits": int(state.get("visits", 0)) + 1,
+    "reply": f"answered: {state.get('query', '')}",
+})
+specialist.add_edge(START, "answer")
+specialist.add_edge("answer", END)
+
+parent = StateGraph(dict, name="parent", worker_count=4)
+parent.add_subgraph(
+    "specialist_node",
+    specialist,
+    namespace="specialist_ns",
+    inputs={"parent_query": "query"},
+    outputs={"specialist_visits": "visits", "specialist_reply": "reply"},
+)
+parent.add_edge(START, "specialist_node")
+parent.add_edge("specialist_node", END)
+
+compiled = parent.compile()
+result = compiled.invoke({"parent_query": "What is AgentCore?"})
+print(result["specialist_reply"])
+```
+
+`inputs` maps parent field names to child field names. `outputs` maps child field names back to parent field names. Fields not mentioned in either mapping are not exchanged.
+
+<Note>
+When parent and child graphs declare overlapping schema fields, `add_node(child_graph)` is a shorthand that binds matching fields by name automatically. Use `add_subgraph(...)` when you need explicit bindings, namespaces, persistent sessions, or knowledge-graph propagation.
+</Note>
+
+## Session modes
+
+`add_subgraph(...)` supports two `session_mode` values:
+
+<Tabs>
+  <Tab title="Ephemeral (default)">
+    Every invocation of the subgraph node creates a fresh child state snapshot. No state persists between parent runs.
+
+    ```python
+    parent.add_subgraph(
+        "worker",
+        worker_graph,
+        inputs={"job_id": "task_id"},
+        outputs={"result": "output"},
+        session_mode="ephemeral",
+    )
+    ```
+
+    Use ephemeral sessions when the child graph is stateless or when each parent run should start from a clean child state.
+  </Tab>
+  <Tab title="Persistent">
+    A child snapshot is stored and reused by `(subgraph node, session_id)`. The session ID comes from a named parent state field.
+
+    ```python
+    parent.add_subgraph(
+        "specialist_session",
+        specialist,
+        namespace="specialist_session",
+        inputs={"specialist_id": "session_id", "prompt": "query"},
+        outputs={"visits": "visits"},
+        session_mode="persistent",
+        session_id_from="specialist_id",
+    )
+    ```
+
+    `session_id_from` must be a parent state field name. Its value at invocation time becomes the session key.
+  </Tab>
+</Tabs>
+
+### Persistent session lifecycle
+
+When a persistent subgraph runs, the engine follows this sequence:
+
+<Steps>
+  <Step title="Resolve session ID">
+    Read the value of the parent state field named by `session_id_from` and normalize it to a canonical string key.
+  </Step>
+  <Step title="Restore or create child snapshot">
+    Look up the last committed child snapshot for `(subgraph node, session_id)`. If none exists, create a fresh child snapshot.
+  </Step>
+  <Step title="Overlay current inputs">
+    Apply the current `inputs` bindings from parent state onto the child state before execution.
+  </Step>
+  <Step title="Run the child graph">
+    Execute the child graph from its entry point.
+  </Step>
+  <Step title="Commit on success">
+    If the child graph completes successfully, commit the full child snapshot to the session table. On failure, cancellation, or a wait result, the last committed snapshot is left unchanged.
+  </Step>
+  <Step title="Apply output bindings">
+    Map declared `outputs` from the committed child snapshot back into parent state.
+  </Step>
+</Steps>
+
+## Full persistent session example
+
+```python
+from agentcore.graph import END, START, StateGraph
+
+
+specialist = StateGraph(dict, name="specialist_child", worker_count=2)
+specialist.add_node(
+    "answer",
+    lambda state, config: {
+        "visits": int(state.get("visits", 0)) + 1,
+        "last_query": state.get("query", ""),
+    },
+)
+specialist.add_edge(START, "answer")
+specialist.add_edge("answer", END)
+
+parent = StateGraph(dict, name="parent", worker_count=4)
+parent.add_subgraph(
+    "specialist_session",
+    specialist,
+    namespace="specialist_session",
+    inputs={"specialist_id": "session_id", "prompt": "query"},
+    outputs={"visits": "visits", "last_query": "last_query"},
+    session_mode="persistent",
+    session_id_from="specialist_id",
+)
+parent.add_edge(START, "specialist_session")
+parent.add_edge("specialist_session", END)
+
+compiled = parent.compile()
+
+# First run for session "alice" — visits starts at 0
+result1 = compiled.invoke({"specialist_id": "alice", "prompt": "hello"})
+print(result1["visits"])  # 1
+
+# Second run for session "alice" — child snapshot is restored
+result2 = compiled.invoke({"specialist_id": "alice", "prompt": "again"})
+print(result2["visits"])  # 2
+
+# First run for session "bob" — separate snapshot
+result3 = compiled.invoke({"specialist_id": "bob", "prompt": "hi"})
+print(result3["visits"])  # 1
+```
+
+Different `session_id` values receive isolated child snapshots. A session started for `"alice"` does not share child state with `"bob"`.
+
+## Inspecting session metadata
+
+Stream events and trace events carry `session_id`, `session_revision`, and `namespaces` when a persistent session is active. Use `invoke_with_metadata(...)` to access them:
+
+```python
+details = compiled.invoke_with_metadata(
+    {"specialist_id": "planner", "prompt": "draft a plan"},
+)
+session_events = [e for e in details["trace"] if e.get("session_id")]
+
+for event in session_events:
+    print(event["node_name"], event["session_id"], event["session_revision"])
+```
+
+## Concurrency rules
+
+<Warning>
+Concurrent reuse of the same `(subgraph node, session_id)` within a single run is rejected by the runtime rather than merged implicitly. Distinct session IDs may run concurrently using `abatch(...)`.
+</Warning>
+
+```python
+import asyncio
+
+compiled = parent.compile()
+
+# These run concurrently because they use distinct session IDs
+results = asyncio.run(compiled.abatch([
+    {"specialist_id": "alice", "prompt": "task a"},
+    {"specialist_id": "bob",   "prompt": "task b"},
+]))
+```
+
+Attempting to invoke the same session ID concurrently within one run is a deterministic error, not a race condition.
+
+## Knowledge-graph propagation
+
+By default, child graphs receive an empty knowledge graph. Set `propagate_knowledge_graph=True` to seed the child-local knowledge graph from the parent when the session is first created.
+
+```python
+parent.add_subgraph(
+    "enriched_specialist",
+    specialist,
+    inputs={"session_id": "session_id"},
+    outputs={"result": "result"},
+    session_mode="persistent",
+    session_id_from="session_id",
+    propagate_knowledge_graph=True,
+)
+```
+
+For persistent sessions, the parent knowledge graph is only copied on initial session creation. Later invocations reuse the committed child-local graph. Parent and child knowledge graphs do not automatically merge outside explicit output bindings.
+
+## SpecialistTeam pattern
+
+For multi-agent workflows that dispatch to multiple specialists in parallel, the `SpecialistTeam` builder handles the fan-out/join wiring automatically. See the [patterns guide](/guides/patterns) for a full walkthrough.

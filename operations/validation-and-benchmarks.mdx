@@ -1,0 +1,109 @@
+---
+title: "AgentCore validation: tests, benchmarks, and smoke tests"
+description: "Run the AgentCore test suite, Python smoke tests, native benchmarks, and the LangGraph head-to-head comparison. Includes benchmark results from April 2026."
+---
+
+AgentCore ships native C++ tests, Python smoke tests, and benchmark executables. Pick the validation lane that matches the scope of your change — you don't need to run everything after every edit.
+
+## Validation lanes
+
+| Change type | Suggested first pass |
+|---|---|
+| Python graph API or examples | Local build + Python smoke tests |
+| Scheduler, state, checkpoint, or replay behavior | `release-perf` build + `ctest` + native benchmarks |
+| MCP or OpenTelemetry integration | Python smoke tests |
+| Published package candidate | Wheel smoke + clean install test |
+| Benchmark document update | Rerun with `release-perf` build, keep build type visible |
+
+## Full validation pass
+
+<Steps>
+  <Step title="Build with the release-perf preset">
+    ```bash
+    cmake --preset release-perf
+    cmake --build --preset release-perf -j
+    ```
+  </Step>
+  <Step title="Run the native test suite">
+    ```bash
+    ctest --preset release-perf
+    ```
+  </Step>
+  <Step title="Run native benchmarks">
+    ```bash
+    ./build/release-perf/agentcore_runtime_benchmark
+    ./build/release-perf/agentcore_persistent_subgraph_session_benchmark
+    ```
+  </Step>
+  <Step title="Build Python bindings">
+    ```bash
+    cmake -S . -B build -DAGENTCORE_BUILD_PYTHON_BINDINGS=ON -DAGENTCORE_BUILD_BENCHMARKS=ON
+    cmake --build build -j
+    ```
+  </Step>
+  <Step title="Run Python smoke tests">
+    ```bash
+    PYTHONPATH=./build/python python3 ./python/tests/state_graph_api_smoke.py
+    PYTHONPATH=./build/python python3 ./python/tests/agent_workflows_smoke.py
+    PYTHONPATH=./build/python python3 ./python/tests/patterns_smoke.py
+    PYTHONPATH=./build/python python3 ./python/tests/adapters_runtime_smoke.py
+    PYTHONPATH=./build/python python3 ./python/tests/mcp_runtime_smoke.py
+    PYTHONPATH=./build/python python3 ./python/tests/context_state_smoke.py
+    PYTHONPATH=./build/python python3 ./python/tests/real_world_pipeline_test.py
+    PYTHONPATH=./build/python python3 ./python/tests/graph_store_pipeline_test.py
+    ```
+  </Step>
+  <Step title="Run the LangGraph head-to-head benchmark">
+    ```bash
+    python3 -m pip install "langgraph==0.6.11"
+    AGENTCORE_BUILD_PYTHON_ROOT=./build/release-perf/python python3 \
+      ./python/benchmarks/langgraph_head_to_head.py
+    ```
+    For machine-readable output:
+    ```bash
+    AGENTCORE_BUILD_PYTHON_ROOT=./build/release-perf/python python3 \
+      ./python/benchmarks/langgraph_head_to_head.py --format json
+    ```
+  </Step>
+</Steps>
+
+## Benchmark results
+
+The snapshot below was generated on April 29, 2026 from a `release-perf` build on Python 3.9.18, Linux x86_64, Intel Xeon W-10885M @ 2.40GHz, against LangGraph 0.6.11.
+
+<Note>
+These are workload-specific measurements on one machine, not universal performance guarantees. Always name the build type and profile when publishing numbers.
+</Note>
+
+### Same-code builder path
+
+| Metric | LangGraph | AgentCore compat | Speedup |
+|---|---:|---:|---:|
+| Invoke avg latency | 13.208 ms | 716.199 µs | **18.44x** faster |
+| Invoke throughput | 75.7/s | 1,396.3/s | — |
+| Stream avg latency | 9.980 ms | 351.012 µs | **28.43x** faster |
+| Stream throughput | 100.2/s | 2,848.9/s | — |
+| Batch avg cost/item | 5.884 ms | 274.951 µs | **21.40x** faster |
+
+### Native runtime features
+
+| Workload | LangGraph | AgentCore native | Speedup |
+|---|---:|---:|---:|
+| Persistent specialist memory (avg latency/round) | 74.487 ms | 3.425 ms | **21.75x** faster |
+| Persistent specialist memory (peak RSS) | 105.4 MiB | 30.2 MiB | 71.3% less |
+| Pause + resume avg latency | 10.611 ms | 472.280 µs | **22.47x** faster |
+| Direct invoke avg latency | 1.814 ms | 80.096 µs | **22.65x** faster |
+| Persistent session fan-out (24 sessions) | 157.192 ms | 6.182 ms | **25.43x** faster |
+
+## Native regression benchmark coverage
+
+The native benchmarks are structural regression gates, not just timing measurements. They assert correctness invariants alongside performance counters.
+
+Key coverage areas:
+
+- **Context-graph ranking** — cold build and warm cached ranking over tasks, claims, evidence, decisions, memories, and knowledge triples. Sample counters: `context_graph_cold_rank_ns`, `context_graph_warm_rank_avg_ns`
+- **Knowledge ingestion** — batched entity/triple commits, exact-match lookup, final store cardinality. Counters: `knowledge_ingest_triples`, `knowledge_ingest_batches`, `knowledge_ingest_exact_matched`
+- **Deterministic memoization** — verifies executor invocations collapse to 1 on stable declared inputs, and remain at the full visit count when a declared key changes
+- **Persistent session replay** — asserts equal final state and equal proof digest between uninterrupted and resumed runs, plus expected committed session counts and no duplicate once-only producer calls
+- **Recorded effects** — hit/miss cost for the task-journal seam
+- **Stream cursor cost** — read cost for public stream event access

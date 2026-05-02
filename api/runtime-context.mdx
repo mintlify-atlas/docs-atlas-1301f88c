@@ -1,0 +1,395 @@
+---
+title: "RuntimeContext API reference"
+description: "Complete reference for the RuntimeContext passed to node callbacks, covering intelligence, knowledge, tool and model invocation, and routing helpers."
+---
+
+`RuntimeContext` is injected into Python node callbacks that declare a third positional argument (`state, config, runtime`). It provides access to the native intelligence store, knowledge graph, registered tools and models, context assembly, and idempotent recorded-effect helpers — all scoped to the active node execution.
+
+```python
+def my_node(state, config, runtime):
+    if not runtime.available:
+        return {}
+    # use runtime here
+```
+
+<ParamField path="runtime.available" type="bool">
+  `True` when the callback is executing inside a live native run. `False` in unit test contexts where no native runtime is wired.
+</ParamField>
+
+## Intelligence operations
+
+`runtime.intelligence` is the preferred grouped surface for all intelligence-related operations.
+
+<AccordionGroup>
+
+  <Accordion title="Snapshots and summaries">
+
+    ```python
+    snapshot = runtime.intelligence.snapshot()
+    summary  = runtime.intelligence.summary()
+    ```
+
+    `snapshot()` returns the full committed intelligence snapshot for the current run. `summary()` returns a compact counts-only summary.
+
+    **Snapshot shape:**
+    - `counts` — per-kind record counts
+    - `tasks` — list of task records
+    - `claims` — list of claim records
+    - `evidence` — list of evidence records
+    - `decisions` — list of decision records
+    - `memories` — list of memory records
+
+    Each list entry carries a stable numeric `id`, a string `key`, and typed fields for that record category. Payload-bearing fields (`details`, `content`, `summary`) round-trip through the native blob store and return as ordinary Python objects.
+
+  </Accordion>
+
+  <Accordion title="Querying intelligence">
+
+    ```python
+    count   = runtime.intelligence.count(kind=None, key=None, ...)
+    found   = runtime.intelligence.exists(**filters)
+    results = runtime.intelligence.query(kind=None, ..., limit=None)
+    ```
+
+    All filter parameters are keyword-only and optional:
+
+    <ParamField path="kind" type="str | None">
+      One of `all`, `task`/`tasks`, `claim`/`claims`, `evidence`, `decision`/`decisions`, `memory`/`memories`.
+    </ParamField>
+
+    <ParamField path="key" type="str | None">Exact record key match.</ParamField>
+    <ParamField path="key_prefix" type="str | None">Record key prefix match.</ParamField>
+    <ParamField path="task_key" type="str | None">Filter by linked task key.</ParamField>
+    <ParamField path="claim_key" type="str | None">Filter by linked claim key.</ParamField>
+    <ParamField path="subject" type="str | None">Semantic subject filter; requires `kind="claims"` or a cross-kind surface.</ParamField>
+    <ParamField path="relation" type="str | None">Semantic relation filter; same kind restriction as `subject`.</ParamField>
+    <ParamField path="object" type="str | None">Semantic object filter; same kind restriction as `subject`.</ParamField>
+    <ParamField path="owner" type="str | None">Filter by record owner.</ParamField>
+    <ParamField path="source" type="str | None">Filter by evidence or memory source.</ParamField>
+    <ParamField path="scope" type="str | None">Filter by memory or context scope.</ParamField>
+    <ParamField path="status" type="str | None">Filter by status; requires `kind` set to `tasks`, `claims`, or `decisions`.</ParamField>
+    <ParamField path="layer" type="str | None">Filter by memory layer; requires `kind="memories"`.</ParamField>
+    <ParamField path="min_confidence" type="float | None">Minimum confidence threshold.</ParamField>
+    <ParamField path="min_importance" type="float | None">Minimum importance threshold; requires `kind="memories"`.</ParamField>
+    <ParamField path="limit" type="int | None">Maximum number of results.</ParamField>
+
+  </Accordion>
+
+  <Accordion title="Focused and ranked views">
+
+    ```python
+    # Tasks ranked by status class, priority, confidence
+    agenda   = runtime.intelligence.agenda(key=None, owner=None, status=None, ...)
+    next_t   = runtime.intelligence.next_task(...)   # first ranked task or None
+
+    # Claims ranked by evidence/decision support
+    claims   = runtime.intelligence.supporting_claims(task_key=None, ...)
+
+    # Tasks ranked by direct anchor match and linked support
+    actions  = runtime.intelligence.action_candidates(task_key=None, claim_key=None, ...)
+
+    # Memories ranked by descending importance
+    memories = runtime.intelligence.recall(key=None, layer=None, ...)
+
+    # Cross-kind bounded snapshot (tasks, claims, evidence, decisions, memories)
+    focus    = runtime.intelligence.focus(task_key=None, limit=5, ...)
+
+    # Neighborhood expansion around one task or claim
+    related  = runtime.intelligence.related(task_key=None, claim_key=None, hops=1)
+    ```
+
+    `focus()` seeds from direct anchors, expands one bounded related set through task/claim links, and returns all five record categories ranked so that direct anchors and decisive support appear first.
+
+    `action_candidates()` stays tasks-only and is optimized for "what should we do next?" queries anchored to specific claims, evidence sources, or memory scopes.
+
+    `related()` behaves as a first-hop expansion at `hops=1`. Larger values expand through linked records in bounded BFS order.
+
+  </Accordion>
+
+  <Accordion title="Writing intelligence records">
+
+    ```python
+    runtime.intelligence.upsert_task(
+        key,
+        *, title=None, owner=None, details=None,
+        result=None, status=None, priority=None, confidence=None,
+    )
+
+    runtime.intelligence.upsert_claim(
+        key,
+        *, subject=None, relation=None, object=None,
+        statement=None, status=None, confidence=None,
+    )
+
+    runtime.intelligence.add_evidence(
+        key,
+        *, kind=None, source=None, content=None,
+        task_key=None, claim_key=None, confidence=None,
+    )
+
+    runtime.intelligence.record_decision(
+        key,
+        *, task_key=None, claim_key=None,
+        summary=None, status=None, confidence=None,
+    )
+
+    runtime.intelligence.remember(
+        key,
+        *, layer=None, scope=None, content=None,
+        task_key=None, claim_key=None, importance=None,
+    )
+    ```
+
+    All write methods are upserts: calling them again with the same `key` updates the existing record.
+
+  </Accordion>
+
+</AccordionGroup>
+
+## Knowledge operations
+
+`runtime.knowledge` is the grouped surface for native knowledge-graph operations.
+
+<AccordionGroup>
+
+  <Accordion title="Writing entities and triples">
+
+    ```python
+    runtime.knowledge.upsert_entity(label, *, payload=None)
+    runtime.knowledge.upsert_triple(subject, relation, object, *, payload=None)
+    ```
+
+    `label`, `subject`, `relation`, and `object` must be non-empty strings.
+
+  </Accordion>
+
+  <Accordion title="Querying the knowledge graph">
+
+    ```python
+    result = runtime.knowledge.query(
+        subject=None, relation=None, object=None,
+        direction="match", limit=None,
+    )
+    ```
+
+    Returns `{"triples": [...], "counts": {"entities": n, "triples": n}, "staged": bool}`.
+
+    `direction` values:
+    - `"match"` — exact filter matching
+    - `"incoming"` — treats `subject` as the target entity when no `object` is supplied
+    - `"neighborhood"` / `"both"` — outgoing plus incoming triples around `subject`
+
+    ```python
+    result = runtime.knowledge.neighborhood(entity, *, relation=None, limit=None)
+    ```
+
+    Convenience wrapper for `query(..., direction="neighborhood")`.
+
+  </Accordion>
+
+  <Accordion title="Loading from and syncing to external stores">
+
+    ```python
+    # Load from an external store into native runtime knowledge
+    result = runtime.knowledge.load_query(
+        *, store, subject=None, relation=None, object=None,
+        direction="match", depth=1, limit=None, properties=None,
+    )
+    result = runtime.knowledge.load_neighborhood(
+        entity=None,
+        *, store, subject=None, relation=None,
+        depth=1, limit=None, properties=None,
+    )
+
+    # Write native knowledge back to an external store
+    result = runtime.knowledge.sync_to_store(
+        store,
+        *, subject=None, relation=None, object=None,
+        direction="match", limit=None,
+    )
+    ```
+
+    `load_query` and `load_neighborhood` read from a registered `GraphStoreRegistryView` store, stage the returned entities and triples into native runtime knowledge, and return a dict with `entities`, `triples`, optional `store`, optional `subject`, and optional `metadata`.
+
+    `sync_to_store` queries native runtime knowledge and writes the selected triples into the named external store.
+
+  </Accordion>
+
+</AccordionGroup>
+
+## Tool and model invocation
+
+```python
+# Tool invocation
+output  = runtime.invoke_tool(name, request, decode="auto")
+details = runtime.invoke_tool_with_metadata(name, request, decode="auto")
+
+# Model invocation
+output  = runtime.invoke_model(name, prompt, schema=None, max_tokens=0, decode="auto")
+details = runtime.invoke_model_with_metadata(name, prompt, schema=None, max_tokens=0, decode="auto")
+```
+
+<ParamField path="name" type="str">
+  The registered tool or model name.
+</ParamField>
+
+<ParamField path="request" type="any">
+  Tool request payload. Encoded to the native adapter format automatically.
+</ParamField>
+
+<ParamField path="prompt" type="any">
+  Model prompt. Accepts a plain Python value, `PromptTemplate`, `ChatPromptTemplate`, `RenderedPrompt`, `RenderedChatPrompt`, or `RenderedMCPPrompt`. Prompt objects are normalized before the request crosses into the native registry.
+</ParamField>
+
+<ParamField path="schema" type="any | None" default="None">
+  Optional JSON schema for structured model output. May also be a prompt object.
+</ParamField>
+
+<ParamField path="max_tokens" type="int" default="0">
+  Maximum tokens for model responses. `0` uses the model's default.
+</ParamField>
+
+<ParamField path="decode" type="str" default="auto">
+  Output decoding mode for the response. `"auto"` applies JSON parsing when the response is valid JSON.
+</ParamField>
+
+`invoke_tool` and `invoke_model` raise an error when `details["ok"]` is `False`. Use the `_with_metadata` variants to inspect the full details including `flags`, `attempts`, `latency_ns`, and `error_category`.
+
+## Recorded effects
+
+```python
+value   = runtime.record_once(key, request, producer)
+details = runtime.record_once_with_metadata(key, request, producer)
+```
+
+`record_once` invokes `producer()` exactly once per `(key, request)` pair within the active run. On subsequent executions (including checkpoint restores), the previously committed result is returned without calling `producer` again.
+
+`record_once_with_metadata` returns a dictionary with:
+
+| Field | Description |
+|---|---|
+| `value` | The produced value. |
+| `replayed` | `True` when the value came from a prior committed effect rather than a fresh call to `producer`. |
+| `flags` | Native result flags for the recorded-effect entry. |
+
+<ParamField path="key" type="str">
+  Non-empty string identifying the effect within this run.
+</ParamField>
+
+<ParamField path="request" type="any">
+  Request payload used to validate re-execution. The native runtime checks that the same key always carries the same request payload.
+</ParamField>
+
+<ParamField path="producer" type="callable">
+  Zero-argument callable that produces the effect value. Called at most once per run.
+</ParamField>
+
+## Routing helpers
+
+```python
+from agentcore import IntelligenceRule, IntelligenceRouter, IntelligenceSubscription
+```
+
+### `IntelligenceRule`
+
+```python
+rule = IntelligenceRule(
+    goto,
+    *, kind=None, key=None, key_prefix=None,
+    task_key=None, claim_key=None,
+    subject=None, relation=None, object=None,
+    owner=None, source=None, scope=None,
+    status=None, layer=None,
+    min_confidence=None, min_importance=None,
+    min_count=1, max_count=None,
+)
+```
+
+Specifies a condition and a destination node name. `runtime.intelligence.route(rules)` evaluates the rules in order and returns the first matching `goto` value.
+
+<ParamField path="goto" type="str">
+  Node name to route to when this rule matches.
+</ParamField>
+
+<ParamField path="min_count" type="int" default="1">
+  Minimum number of matching records required for the rule to fire.
+</ParamField>
+
+<ParamField path="max_count" type="int | None" default="None">
+  Maximum number of matching records allowed for the rule to fire. `None` means no upper bound.
+</ParamField>
+
+### `IntelligenceRouter`
+
+```python
+router = IntelligenceRouter(rules, default=None)
+```
+
+A callable wrapper for use with `StateGraph.add_conditional_edges`. When called as `router(state, config, runtime)`, it evaluates its rules list and returns the selected route name or `default`.
+
+<ParamField path="rules" type="list[IntelligenceRule]">
+  Ordered list of `IntelligenceRule` instances.
+</ParamField>
+
+<ParamField path="default" type="str | None" default="None">
+  Route to return when no rule matches. `None` produces no routing override.
+</ParamField>
+
+### `IntelligenceSubscription`
+
+```python
+sub = IntelligenceSubscription(
+    kind=None, key=None, key_prefix=None,
+    task_key=None, claim_key=None,
+    subject=None, relation=None, object=None,
+    owner=None, source=None, scope=None,
+    status=None, layer=None,
+    min_confidence=None, min_importance=None,
+)
+```
+
+Passed to `StateGraph.add_node(..., intelligence_subscriptions=[sub])` to mark a node as intelligence-reactive. The native reactive frontier scheduler re-enqueues the node when committed intelligence deltas match the subscription filters.
+
+## Code examples
+
+```python
+from agentcore import StateGraph, START, END, IntelligenceRule, IntelligenceRouter
+
+def planner(state, config, runtime):
+    runtime.intelligence.upsert_task(
+        "plan_task",
+        title="Analyze input",
+        status="pending",
+        priority=10,
+    )
+    return {}
+
+def router_fn(state, config, runtime):
+    task = runtime.intelligence.next_task(status="pending")
+    if task:
+        return "execute"
+    return "done"
+
+def executor(state, config, runtime):
+    result = runtime.invoke_model("chat", state.get("prompt", ""))
+    runtime.intelligence.upsert_task("plan_task", status="complete", result=result)
+    runtime.intelligence.add_evidence(
+        "exec_evidence",
+        source="model",
+        content=result,
+        task_key="plan_task",
+        confidence=0.9,
+    )
+    return {"output": result}
+
+graph = (
+    StateGraph()
+    .add_node("planner", planner)
+    .add_node("executor", executor)
+    .add_node("done", lambda s: s)
+    .add_edge(START, "planner")
+    .add_conditional_edges("planner", router_fn)
+    .add_edge("executor", END)
+    .add_edge("done", END)
+)
+```

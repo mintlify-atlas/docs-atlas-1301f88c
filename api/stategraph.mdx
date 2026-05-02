@@ -1,0 +1,425 @@
+---
+title: "StateGraph API reference"
+description: "Complete reference for StateGraph, covering all builder methods, node kinds, subgraph session rules, and schema-driven reducer inference for join barriers."
+---
+
+`StateGraph` is the primary builder class for defining agent workflows. You declare nodes, edges, conditional routes, and subgraphs through its fluent builder API, then call `compile()` to produce an executable `CompiledStateGraph` backed by the native C++20 runtime.
+
+## Constructor
+
+```python
+from agentcore import StateGraph
+
+graph = StateGraph(state_schema=None, *, name=None, worker_count=1)
+```
+
+<ParamField path="state_schema" type="type | None" default="None">
+  A `TypedDict` subclass or similar class with `__annotations__`. When provided, AgentCore infers schema-driven reducer strategies from `Annotated[T, reducer]` field metadata and restricts join barriers to those field shapes. Pass `None` to use an untyped dict state.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Human-readable name for this graph. Defaults to `state_schema.__name__` when a schema is given, or `"agentcore_state_graph"` otherwise. The name is carried through to compiled graph instances and telemetry traces.
+</ParamField>
+
+<ParamField path="worker_count" type="int" default="1">
+  Number of native worker threads to provision when this graph is compiled without an explicit `worker_count` override. Increases parallelism across fan-out branches.
+</ParamField>
+
+## Builder methods
+
+All builder methods return `self`, so calls can be chained.
+
+### `add_node`
+
+```python
+graph.add_node(
+    name_or_action,
+    action=None,
+    *,
+    kind="compute",
+    stop_after=False,
+    allow_fan_out=False,
+    create_join_scope=False,
+    join_incoming_branches=False,
+    deterministic=False,
+    read_keys=None,
+    cache_size=16,
+    intelligence_subscriptions=None,
+    context=None,
+    merge=None,
+)
+```
+
+Registers a node in the graph. The first argument is flexible:
+
+- `add_node("name", action)` — explicit name and callable
+- `add_node(named_fn)` — callable used; its `__name__` becomes the node name
+- `add_node(subgraph)` — `StateGraph` or `CompiledStateGraph`; shared schema fields are bound automatically
+
+<ParamField path="name_or_action" type="str | callable | StateGraph | CompiledStateGraph">
+  Node name string, or a named callable / subgraph when the name should be inferred.
+</ParamField>
+
+<ParamField path="action" type="callable | None" default="None">
+  The Python callback to invoke when this node executes. May accept `state`, `(state, config)`, or `(state, config, runtime)`. Lambdas and anonymous callables require an explicit `name` string.
+</ParamField>
+
+<ParamField path="kind" type="str" default="compute">
+  Node execution kind. Supported values: `compute`, `control`, `tool`, `model`, `aggregate`, `human`. See [node kinds](#node-kinds) below.
+</ParamField>
+
+<ParamField path="stop_after" type="bool" default="false">
+  When `True`, the scheduler pauses after this node completes, enabling human-in-the-loop or checkpoint patterns.
+</ParamField>
+
+<ParamField path="allow_fan_out" type="bool" default="false">
+  Permits this node to issue multiple outgoing transitions simultaneously. Combine with `create_join_scope=True` to pair the fan-out with a matching join barrier.
+</ParamField>
+
+<ParamField path="create_join_scope" type="bool" default="false">
+  Opens a native join scope. Branches spawned from this node must converge at a `join_incoming_branches` node before the run continues.
+</ParamField>
+
+<ParamField path="join_incoming_branches" type="bool" default="false">
+  Marks this node as the convergence point for an open join scope. The node waits for all in-flight branches before executing.
+</ParamField>
+
+<ParamField path="deterministic" type="bool" default="false">
+  Enables deterministic caching for this node. Requires `read_keys` to be provided.
+</ParamField>
+
+<ParamField path="read_keys" type="list[str] | None" default="None">
+  State field names that form the cache key for deterministic nodes. Requires `deterministic=True`.
+</ParamField>
+
+<ParamField path="cache_size" type="int" default="16">
+  LRU cache capacity for deterministic node results.
+</ParamField>
+
+<ParamField path="intelligence_subscriptions" type="list[IntelligenceSubscription] | None" default="None">
+  Makes this node intelligence-reactive. The native reactive frontier scheduler re-enqueues the node when committed intelligence deltas match any of the supplied `IntelligenceSubscription` filters.
+</ParamField>
+
+<ParamField path="context" type="ContextSpec | None" default="None">
+  Attaches a context-assembly specification to this node. Call `runtime.context.view()` inside the callback to retrieve the assembled `ContextView`.
+</ParamField>
+
+<ParamField path="merge" type="dict[str, str] | None" default="None">
+  Explicit field-level merge strategy overrides for join nodes. Keys are state field names; values are strategy names such as `"last_writer_wins"` or `"sum_int64"`.
+</ParamField>
+
+### `add_edge`
+
+```python
+graph.add_edge(source, target)
+```
+
+Adds a directed edge from `source` to `target`. When `source` is a list of node names, AgentCore treats it as a multi-source join and automatically marks `target` as a join node.
+
+### `add_conditional_edges`
+
+```python
+graph.add_conditional_edges(source, path, path_map=None)
+```
+
+Routes execution from `source` based on the return value of `path`. When `source` is `START`, this is equivalent to `set_conditional_entry_point`.
+
+<ParamField path="source" type="str">
+  The node from which conditional routing applies.
+</ParamField>
+
+<ParamField path="path" type="callable">
+  A callable with the same arity contract as node callbacks. Return a key that maps into `path_map`, or a node name directly when `path_map` is `None`.
+</ParamField>
+
+<ParamField path="path_map" type="dict | None" default="None">
+  Optional mapping from route return values to node names.
+</ParamField>
+
+### `add_subgraph`
+
+```python
+graph.add_subgraph(
+    name,
+    graph,
+    *,
+    inputs=None,
+    outputs=None,
+    namespace=None,
+    propagate_knowledge_graph=False,
+    session_mode="ephemeral",
+    session_id_from=None,
+)
+```
+
+Registers a child `StateGraph` or `CompiledStateGraph` as a named subgraph node with explicit field bindings. Prefer this over `add_node(subgraph)` whenever you need namespaces, persistent sessions, or non-overlapping field mappings.
+
+<ParamField path="inputs" type="dict[str, str] | None" default="None">
+  Maps parent state field names to child state field names for input.
+</ParamField>
+
+<ParamField path="outputs" type="dict[str, str] | None" default="None">
+  Maps child state field names back to parent state field names on completion.
+</ParamField>
+
+<ParamField path="namespace" type="str | None" default="None">
+  Scopes the child graph's state fields to avoid collisions with parent state.
+</ParamField>
+
+<ParamField path="propagate_knowledge_graph" type="bool" default="false">
+  When `True`, the parent's native knowledge graph is shared with the child run.
+</ParamField>
+
+<ParamField path="session_mode" type="str" default="ephemeral">
+  Either `"ephemeral"` (default, no persistence) or `"persistent"` (child snapshot committed on successful completion).
+</ParamField>
+
+<ParamField path="session_id_from" type="str | None" default="None">
+  Required for `session_mode="persistent"`. Names the parent state field that carries the session ID. Must be `None` for ephemeral sessions.
+</ParamField>
+
+### `add_fanout`
+
+```python
+graph.add_fanout(name, action=None, *, kind="control", create_join_scope=True)
+```
+
+Convenience wrapper for `add_node(..., allow_fan_out=True, create_join_scope=True)`. Use this for dispatch nodes that fan out to multiple branches.
+
+### `add_join`
+
+```python
+graph.add_join(name, action=None, *, merge=None, kind="aggregate")
+```
+
+Convenience wrapper for `add_node(..., join_incoming_branches=True)`. Use this for nodes that collect the results of all fan-out branches.
+
+### `add_sequence`
+
+```python
+graph.add_sequence(nodes)
+```
+
+Registers a list of nodes and wires them in order. Accepts registered node name strings, named callables, or `(name, action)` pairs.
+
+### `set_entry_point`
+
+```python
+graph.set_entry_point(name)
+```
+
+Designates `name` as the first node to execute. Equivalent to `add_edge(START, name)`.
+
+### `set_finish_point`
+
+```python
+graph.set_finish_point(name)
+```
+
+Adds an edge from `name` to `END`. Equivalent to `add_edge(name, END)`.
+
+### `set_conditional_entry_point`
+
+```python
+graph.set_conditional_entry_point(path, path_map=None)
+```
+
+Sets a conditional routing function that runs before the first node. Equivalent to `add_conditional_edges(START, path, path_map)`.
+
+### `compile`
+
+```python
+compiled = graph.compile(
+    *,
+    worker_count=None,
+    name=None,
+    debug=None,
+    checkpointer=None,
+    interrupt_before=None,
+    interrupt_after=None,
+    store=None,
+)
+```
+
+Finalizes the graph and returns a `CompiledStateGraph` backed by the native runtime.
+
+<ParamField path="worker_count" type="int | None" default="None">
+  Overrides the worker count from the constructor. When `None`, the constructor value is used.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Overrides the compiled graph name for this instance only.
+</ParamField>
+
+<ParamField path="debug" type="bool | None" default="None">
+  Accepted for migration convenience; does not change runtime behavior.
+</ParamField>
+
+<Warning>
+  `checkpointer`, `interrupt_before`, `interrupt_after`, and `store` raise `NotImplementedError`. Use AgentCore's native wait/resume, pause-with-metadata, and persistent subgraph session surfaces instead.
+</Warning>
+
+## Node kinds
+
+<AccordionGroup>
+  <Accordion title="compute">
+    General-purpose node for transformation and side-effect logic. The default kind.
+  </Accordion>
+  <Accordion title="control">
+    Routing and dispatch node. Typically does not write state. Used as the default kind for `add_fanout`.
+  </Accordion>
+  <Accordion title="tool">
+    Node that wraps a registered tool invocation.
+  </Accordion>
+  <Accordion title="model">
+    Node that wraps a registered model invocation.
+  </Accordion>
+  <Accordion title="aggregate">
+    Join-side node that collects results from multiple branches. The default kind for `add_join`.
+  </Accordion>
+  <Accordion title="human">
+    Node that pauses the run for human input or review.
+  </Accordion>
+</AccordionGroup>
+
+## Subgraph session rules
+
+- `session_mode="ephemeral"` is the default and requires `session_id_from=None`.
+- `session_mode="persistent"` requires a non-empty `session_id_from` string naming a parent state field.
+- Persistent sessions commit the child snapshot only on successful child completion.
+- Concurrent reuse of the same `(subgraph node, session_id)` pair within a single run is rejected.
+
+## Schema-driven reducers
+
+When `state_schema` uses `Annotated[T, reducer]` field annotations, AgentCore infers join-barrier merge strategies automatically.
+
+| Annotation | Inferred strategy |
+|---|---|
+| `Annotated[int, operator.add]` | `sum_int64` |
+| `Annotated[int, min]` | `min_int64` |
+| `Annotated[int, max]` | `max_int64` |
+| `Annotated[list[T], operator.add]` | `concat_sequence` |
+| `Annotated[list[dict], add_messages]` | `merge_messages` |
+| `Annotated[bool, operator.or_]` | `logical_or` |
+| `Annotated[bool, operator.and_]` | `logical_and` |
+
+List concatenation is stored as a native tagged sequence merge and decoded back to Python lists. Message merging replaces entries with a matching non-empty `id` in place; messages without an `id` append.
+
+Reducers outside this subset are not inferred automatically. Use explicit `merge={...}` rules or a post-join aggregation node for custom merge shapes.
+
+### MessagesState helper
+
+```python
+from agentcore.graph import MessagesState, add_messages
+from typing import TypedDict
+
+class AgentState(MessagesState, total=False):
+    summary: str
+```
+
+`MessagesState` pre-declares `messages: Annotated[list[dict], add_messages]`. The standalone `add_messages(left, right)` function has the same append-or-replace-by-id behavior in Python and compiles to the native `merge_messages` strategy at join barriers.
+
+## Code examples
+
+<CodeGroup>
+
+```python Linear pipeline
+from agentcore import StateGraph, START, END
+from typing import TypedDict
+
+class State(TypedDict, total=False):
+    text: str
+    result: str
+
+def preprocess(state):
+    return {"text": state["text"].strip()}
+
+def analyze(state):
+    return {"result": f"analyzed: {state['text']}"}
+
+graph = (
+    StateGraph(State)
+    .add_node(preprocess)
+    .add_node(analyze)
+    .add_edge(START, "preprocess")
+    .add_edge("preprocess", "analyze")
+    .add_edge("analyze", END)
+)
+compiled = graph.compile()
+```
+
+```python Conditional routing
+from agentcore import StateGraph, START, END
+
+def router(state):
+    return "branch_a" if state.get("flag") else "branch_b"
+
+graph = StateGraph()
+graph.add_node("branch_a", lambda s: {"result": "A"})
+graph.add_node("branch_b", lambda s: {"result": "B"}, kind="compute")
+graph.set_conditional_entry_point(router)
+graph.set_finish_point("branch_a")
+graph.set_finish_point("branch_b")
+compiled = graph.compile()
+```
+
+```python Fan-out and join
+from agentcore import StateGraph, START, END
+from typing import Annotated, TypedDict
+import operator
+
+class State(TypedDict, total=False):
+    items: Annotated[list[str], operator.add]
+
+def dispatch(state):
+    return {}
+
+def worker_a(state):
+    return {"items": ["a"]}
+
+def worker_b(state):
+    return {"items": ["b"]}
+
+def aggregate(state):
+    return {}
+
+graph = (
+    StateGraph(State)
+    .add_fanout("dispatch", dispatch)
+    .add_node("worker_a", worker_a)
+    .add_node("worker_b", worker_b)
+    .add_join("aggregate", aggregate)
+    .add_edge(START, "dispatch")
+    .add_edge("dispatch", "worker_a")
+    .add_edge("dispatch", "worker_b")
+    .add_edge(["worker_a", "worker_b"], "aggregate")
+    .add_edge("aggregate", END)
+)
+compiled = graph.compile(worker_count=2)
+```
+
+```python Subgraph with persistent session
+from agentcore import StateGraph, START, END
+
+child = StateGraph(name="child_graph")
+child.add_node("step", lambda s: {"done": True})
+child.add_edge(START, "step")
+child.add_edge("step", END)
+
+parent = StateGraph()
+parent.add_node("entry", lambda s: {"session": "user-123"})
+parent.add_subgraph(
+    "child",
+    child,
+    inputs={"session": "session_id"},
+    outputs={"done": "child_done"},
+    session_mode="persistent",
+    session_id_from="session",
+)
+parent.add_edge(START, "entry")
+parent.add_edge("entry", "child")
+parent.add_edge("child", END)
+compiled = parent.compile()
+```
+
+</CodeGroup>

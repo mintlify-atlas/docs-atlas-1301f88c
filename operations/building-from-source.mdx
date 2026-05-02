@@ -1,0 +1,107 @@
+---
+title: "Build AgentCore from source: CMake presets and wheels"
+description: "Build the AgentCore native runtime and Python bindings from source using CMake. Covers prerequisites, presets, Python wheel creation, and build tree usage."
+---
+
+AgentCore's published wheels cover Linux x86_64 for CPython 3.9–3.12. For other environments, or when you want to develop against the native runtime directly, build from source using CMake 3.20 or later with a C++20-capable compiler.
+
+## Prerequisites
+
+- CMake ≥ 3.20
+- A C++20 compiler (`c++` / `g++` / `clang++`)
+- Python 3.9–3.12 (for Python bindings)
+- scikit-build-core (for wheel builds): `pip install scikit-build-core`
+
+## Basic build
+
+<Steps>
+  <Step title="Configure and build">
+    ```bash
+    cmake -S . -B build
+    cmake --build build -j
+    ```
+  </Step>
+  <Step title="Run the test suite">
+    ```bash
+    ctest --test-dir build --output-on-failure
+    ```
+  </Step>
+  <Step title="Build with Python bindings">
+    Add `-DAGENTCORE_BUILD_PYTHON_BINDINGS=ON` to include the Python package:
+    ```bash
+    cmake -S . -B build -DAGENTCORE_BUILD_PYTHON_BINDINGS=ON
+    cmake --build build -j
+    ```
+    Use the build tree directly without installing:
+    ```bash
+    PYTHONPATH=./build/python python3 -c "from agentcore.graph import StateGraph; print('ok')"
+    ```
+  </Step>
+  <Step title="Build a pip-installable wheel">
+    ```bash
+    CC=cc CXX=c++ python3 -m pip wheel . -w dist
+    python3 -m pip install --target /tmp/agentcore-test dist/agentcore_graph-*.whl
+    PYTHONPATH=/tmp/agentcore-test python3 -c "from agentcore.graph import StateGraph; print('ok')"
+    ```
+  </Step>
+</Steps>
+
+## CMake presets
+
+The repository ships presets for optimized builds, debug builds, and sanitizer builds:
+
+<CodeGroup>
+```bash release-perf
+cmake --preset release-perf
+cmake --build --preset release-perf -j
+ctest --preset release-perf
+```
+
+```bash relwithdebinfo-perf
+cmake --preset relwithdebinfo-perf
+cmake --build --preset relwithdebinfo-perf -j
+```
+
+```bash asan
+cmake --preset asan
+cmake --build --preset asan -j
+ctest --preset asan
+```
+
+```bash ubsan
+cmake --preset ubsan
+cmake --build --preset ubsan -j
+ctest --preset ubsan
+```
+
+```bash tsan
+cmake --preset tsan
+cmake --build --preset tsan -j
+ctest --preset tsan
+```
+</CodeGroup>
+
+<Note>
+Run `cmake --list-presets` from the repository root to see all available presets for your CMake version.
+</Note>
+
+Use `release-perf` for benchmark runs and release-candidate validation. Use `asan`/`ubsan`/`tsan` for catching memory errors, undefined behavior, and data races during development.
+
+## Useful CMake cache variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AGENTCORE_BUILD_PYTHON_BINDINGS` | `OFF` | Build the Python extension module |
+| `AGENTCORE_BUILD_BENCHMARKS` | `OFF` | Build native benchmark executables |
+| `AGENTCORE_BUILD_EXAMPLES` | `OFF` | Build C++ example programs |
+| `BUILD_TESTING` | `ON` | Build the test suite |
+
+## After building
+
+The build emits:
+- `./build/python/agentcore` — Python package (use with `PYTHONPATH=./build/python`)
+- `./build/python/langgraph` — Generated LangGraph compatibility package
+- `./build/release-perf/agentcore_runtime_benchmark` — Native benchmark binary
+- `./build/release-perf/agentcore_persistent_subgraph_session_benchmark` — Persistent session benchmark
+
+For validation and benchmark commands, see [Validation and benchmarks](/operations/validation-and-benchmarks).

@@ -1,0 +1,213 @@
+---
+title: "Migrating from LangGraph to AgentCore step by step"
+description: "Move existing LangGraph StateGraph code to AgentCore with minimal changes. Covers import swap, callback signatures, pause/resume, reducers, and subgraphs."
+---
+
+AgentCore's Python builder uses the same mental model as LangGraph — `StateGraph`, `add_node`, `add_edge`, `add_conditional_edges`, `compile` — so most graph structure carries over with only an import change. This guide walks through the migration in layers, from the fastest path to the native features that are hardest to bolt on later.
+
+## Fastest path
+
+Swap imports and add a worker count:
+
+<Tabs>
+  <Tab title="Before (LangGraph)">
+    ```python
+    from langgraph.graph import StateGraph, START, END
+    from langgraph.types import Command
+    ```
+  </Tab>
+  <Tab title="After (AgentCore)">
+    ```python
+    from agentcore.graph import StateGraph, START, END, Command
+    ```
+  </Tab>
+</Tabs>
+
+For many simple graphs, the rest of the code stays structurally identical.
+
+## Local side-by-side evaluation
+
+Before changing any imports, you can benchmark your existing `langgraph.graph` code against AgentCore's backend. Build AgentCore locally and run your script against the generated compatibility package:
+
+```bash
+cmake -S . -B build -DAGENTCORE_BUILD_PYTHON_BINDINGS=ON
+cmake --build build -j
+PYTHONPATH=./build/python python3 your_existing_langgraph_script.py
+```
+
+This path is useful for quick performance checks and estimating migration effort before touching imports.
+
+## Recommended migration order
+
+<Steps>
+  <Step title="Run against the compatibility surface">
+    Get a baseline performance reading with zero code changes.
+  </Step>
+  <Step title="Switch imports">
+    Change `from langgraph.graph import ...` to `from agentcore.graph import ...`. Add `name=` and `worker_count=` to `StateGraph(...)`.
+  </Step>
+  <Step title="Keep node bodies unchanged">
+    Unless they depend on framework-specific interrupt, checkpoint, or store behavior.
+  </Step>
+  <Step title="Add explicit tests">
+    Cover final state, streamed events, and pause/resume behavior.
+  </Step>
+  <Step title="Move message history">
+    Adopt `MessagesState` or `Annotated[list[dict], add_messages]`.
+  </Step>
+  <Step title="Adopt ContextSpec">
+    Replace nodes that manually stitch together messages, memories, and state into prompt strings.
+  </Step>
+  <Step title="Move reusable child-agent state to persistent subgraph sessions">
+    Use `add_subgraph(..., session_mode="persistent", session_id_from=...)`.
+  </Step>
+  <Step title="Add OpenTelemetry or MCP last">
+    After graph behavior is stable.
+  </Step>
+</Steps>
+
+## What stays the same
+
+- Graph-builder shape: `add_node`, `add_edge`, `add_conditional_edges`, `compile`
+- State-as-dict workflows and nodes returning partial dict updates
+- `Command(update=..., goto=...)` routing
+- `batch` and `stream` entry points
+- `add_sequence`, `set_finish_point`, `set_entry_point`, conditional entry routing
+- `TypedDict` state schemas with supported `Annotated[...]` reducers
+- `MessagesState` and `add_messages` — same import from `agentcore.graph`
+
+## What changes
+
+### Callback signature
+
+AgentCore callbacks can accept a third `runtime` argument:
+
+```python
+# All three forms are valid
+def node(state): ...
+def node(state, config): ...
+def node(state, config, runtime): ...  # runtime is RuntimeContext
+```
+
+Named callables register without repeating the name:
+
+```python
+graph.add_node(planner_step)
+graph.add_sequence([planner_step, reviewer_step])
+```
+
+### Pause / resume
+
+<Tabs>
+  <Tab title="Before (LangGraph interrupt)">
+    ```python
+    from langgraph.types import interrupt, Command
+
+    def gate(state):
+        approved = interrupt("approve?")
+        return {"approved": bool(approved)}
+    ```
+  </Tab>
+  <Tab title="After (AgentCore wait/resume)">
+    ```python
+    from agentcore.graph import Command
+
+    def gate(state, config):
+        if not state.get("approved", False):
+            return Command(update={"approved": True}, wait=True)
+        return {"ready": True}
+    ```
+    Then resume:
+    ```python
+    paused = compiled.invoke_until_pause_with_metadata({"input": 7})
+    resumed = compiled.resume_with_metadata(paused["summary"]["checkpoint_id"])
+    ```
+  </Tab>
+</Tabs>
+
+### Subgraphs
+
+Replace manual child-graph invocation with `add_subgraph(...)`:
+
+```python
+parent.add_subgraph(
+    "specialist_session",
+    specialist_graph,
+    namespace="specialist_session",
+    inputs={"specialist_id": "session_id", "question": "query"},
+    outputs={"answer": "answer"},
+    session_mode="persistent",
+    session_id_from="specialist_id",
+)
+```
+
+When parent and child share a declared schema, the shorthand still works:
+
+```python
+parent.add_node("specialist_child", specialist_graph)
+```
+
+Use `add_subgraph(...)` when you need explicit bindings, namespaces, persistent sessions, or knowledge-graph propagation.
+
+### compile() differences
+
+<Warning>
+These `compile()` arguments raise `NotImplementedError` instead of being silently ignored. Move to AgentCore-native equivalents before using them:
+
+- `checkpointer=` → use `compiled.invoke_until_pause_with_metadata` / `resume_with_metadata`
+- `interrupt_before=` / `interrupt_after=` → use `Command(wait=True)`
+- `store=` → use `add_subgraph(..., session_mode="persistent", ...)`
+</Warning>
+
+`name=` and `debug=` are accepted for migration convenience.
+
+## Common translation table
+
+| LangGraph pattern | AgentCore pattern |
+|---|---|
+| `StateGraph(...)` | `StateGraph(..., worker_count=N)` |
+| `add_node(step_fn)` | same for named callables |
+| `add_sequence([...])` | same |
+| `set_finish_point("x")` | same |
+| `add_edge(["a","b"], "join")` | same — compiled as join target |
+| `Annotated[int, operator.add]` | same, inferred to `sum_int64` |
+| `MessagesState` / `add_messages` | same import from `agentcore.graph` |
+| `Command(update=..., goto=...)` | same |
+| `interrupt()` + resume | `Command(wait=True)` + `invoke_until_pause_with_metadata` / `resume_with_metadata` |
+| manual child graph + `thread_id` | `add_subgraph(..., session_mode="persistent")` |
+| OpenTelemetry export | `telemetry=True` or `OpenTelemetryObserver()` |
+
+## Minimal before and after
+
+<Tabs>
+  <Tab title="LangGraph">
+    ```python
+    from langgraph.graph import StateGraph, START, END
+
+    def step(state):
+        return {"count": int(state.get("count", 0)) + 1}
+
+    graph = StateGraph(dict)
+    graph.add_node("step", step)
+    graph.add_edge(START, "step")
+    graph.add_edge("step", END)
+    compiled = graph.compile()
+    result = compiled.invoke({"count": 0})
+    ```
+  </Tab>
+  <Tab title="AgentCore">
+    ```python
+    from agentcore.graph import StateGraph, START, END
+
+    def step(state, config):
+        return {"count": int(state.get("count", 0)) + 1}
+
+    graph = StateGraph(dict, name="counter", worker_count=2)
+    graph.add_node("step", step)
+    graph.add_edge(START, "step")
+    graph.add_edge("step", END)
+    compiled = graph.compile()
+    result = compiled.invoke({"count": 0})
+    ```
+  </Tab>
+</Tabs>

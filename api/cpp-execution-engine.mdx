@@ -1,0 +1,517 @@
+---
+title: "ExecutionEngine C++ API reference for AgentCore runs"
+description: "Full reference for ExecutionEngine construction, execution profiles, run lifecycle, operational controls, ExecutionContext, NodeResult, and StatePatch."
+---
+
+`ExecutionEngine` is the central runtime object for native AgentCore embedding. It owns the scheduler, tool and model registries, checkpoint manager, trace sink, and all active run state. You construct one engine, register adapters, and then start, step, and inspect runs through its public methods. The engine is not copyable; share it by pointer or reference if multiple subsystems need access.
+
+<Note>
+  This page covers the native C++ API. Python users should use `StateGraph`, `CompiledStateGraph`, and their associated Python-level methods instead. The Python bindings delegate to the same engine described here.
+</Note>
+
+## Construction
+
+```cpp
+#include "agentcore/execution/engine.h"
+using namespace agentcore;
+
+// Simplest form: let the engine pick a worker count
+ExecutionEngine engine;
+
+// Specify worker count and inline-scheduler flag
+ExecutionEngine engine(4, /*inline_scheduler=*/false);
+
+// Full options struct
+ExecutionEngineOptions opts;
+opts.worker_count      = 4;
+opts.inline_scheduler  = false;
+opts.profile           = ExecutionProfile::Balanced;
+ExecutionEngine engine(opts);
+```
+
+<ParamField body="worker_count" type="std::size_t" default="0">
+  Number of worker threads for the internal `WorkerPool`. `0` lets the engine choose based on hardware concurrency.
+</ParamField>
+
+<ParamField body="inline_scheduler" type="bool" default="false">
+  When `true`, the scheduler runs tasks on the calling thread synchronously. Useful for single-threaded embedding, tests, and benchmark harnesses.
+</ParamField>
+
+<ParamField body="profile" type="ExecutionProfile" default="ExecutionProfile::Balanced">
+  Controls trace retention and checkpoint frequency. See [Execution profiles](#execution-profiles) below.
+</ParamField>
+
+## Execution profiles
+
+`ExecutionProfile` is declared in `execution/checkpoint.h` and accepted by `ExecutionEngineOptions`.
+
+| Value | Behavior |
+|-------|----------|
+| `ExecutionProfile::Strict` | Maximum trace retention; all checkpoints captured; intended for audit-grade runs |
+| `ExecutionProfile::Balanced` | Default; moderate trace retention; checkpoints at configurable intervals and on terminal events |
+| `ExecutionProfile::Fast` | Minimal trace retention; checkpoints reduced; intended for high-throughput batch runs |
+
+The profile value is also passed to `CheckpointManager::configure` and `TraceSink::configure` during engine initialization.
+
+## Graph registration
+
+Before starting a run, register the graph with the engine so subgraph resolution can find it by `GraphId`.
+
+```cpp
+GraphDefinition graph = build_graph(); // see cpp-overview
+engine.register_graph(graph);
+```
+
+`register_graph` stores an internal copy of the definition. You can still pass the same `GraphDefinition` directly to `start(...)` without pre-registering; pre-registration is only required when the graph contains subgraph nodes that reference other graphs by id.
+
+## Running a graph
+
+### Starting a run
+
+```cpp
+InputEnvelope input;
+input.initial_field_count = 4; // reserve capacity for state fields
+// Optionally set initial state values:
+// input.initial_patch.updates.push_back(FieldUpdate{kMyKey, int64_t{42}});
+
+RunId run_id = engine.start(graph, input);
+```
+
+<ParamField body="InputEnvelope.initial_field_count" type="std::size_t" default="0">
+  Pre-allocates the state field array. Set this to the number of `StateKey` slots the graph uses to avoid reallocations during the first few steps.
+</ParamField>
+
+<ParamField body="InputEnvelope.initial_patch" type="StatePatch">
+  State writes applied before the first node executes. Use this to inject initial state values.
+</ParamField>
+
+<ParamField body="InputEnvelope.entry_override" type="std::optional<NodeId>">
+  Overrides the graph `entry` node for this run. Leave empty to use the graph's declared entry point.
+</ParamField>
+
+<ParamField body="InputEnvelope.runtime_config_payload" type="std::vector<std::byte>">
+  Opaque bytes made available on `ExecutionContext::runtime_config_payload` inside every node of this run.
+</ParamField>
+
+You can also pass a `RunCaptureOptions` to control per-run checkpoint and trace capture:
+
+```cpp
+RunCaptureOptions capture;
+capture.capture_checkpoints = true;
+capture.capture_trace       = true;
+RunId run_id = engine.start(graph, input, capture);
+```
+
+### Driving a run
+
+```cpp
+// Run all steps to completion
+RunResult result = engine.run_to_completion(run_id);
+
+// Or step one task at a time
+StepResult step = engine.step(run_id);
+// step.status, step.node_status, step.progressed, step.waiting, ...
+```
+
+`RunResult` carries `run_id`, `status` (`ExecutionStatus`), `steps_executed`, and `last_checkpoint_id`.
+
+`StepResult` carries `run_id`, `node_id`, `branch_id`, `step_index`, `checkpoint_id`, `status`, `node_status`, `progressed`, `waiting`, and `enqueued_tasks`.
+
+### `ExecutionStatus` values
+
+| Value | Meaning |
+|-------|---------|
+| `NotStarted` | Run not yet started |
+| `Running` | Actively executing |
+| `Paused` | All branches waiting; run can be resumed or inspected |
+| `Completed` | Reached terminal node or `StopAfterNode` |
+| `Failed` | A node returned `HardFail` |
+| `Cancelled` | Run was cancelled via a `CancellationToken` |
+
+## Operational control surface
+
+These methods implement the durable-run control plane. They are designed to be called from a supervisor thread while the run is executing or paused.
+
+### Checkpoint persistence
+
+```cpp
+// File-based checkpoint storage
+engine.enable_checkpoint_persistence("/var/agentcore/checkpoints/run.bin");
+
+// SQLite-based storage (recommended for multi-run environments)
+engine.enable_sqlite_checkpoint_persistence("/var/agentcore/checkpoints/runs.db");
+
+// Custom backend
+auto backend = make_file_checkpoint_storage("/tmp/my_checkpoints.bin");
+engine.set_checkpointer(std::move(backend));
+
+// Restore persisted checkpoints into the manager on startup
+std::size_t loaded = engine.load_persisted_checkpoints();
+```
+
+Control snapshot frequency with `CheckpointPolicy`:
+
+```cpp
+CheckpointPolicy policy;
+policy.snapshot_interval_steps = 32;    // full snapshot every N steps
+policy.snapshot_on_wait        = true;  // snapshot when a branch enters Paused
+policy.snapshot_on_terminal    = true;  // snapshot on Completed/Failed/Cancelled
+policy.snapshot_on_failure     = true;  // snapshot on HardFail
+policy.snapshot_on_join_events = true;  // snapshot on join barrier completion
+engine.set_checkpoint_policy(policy);
+```
+
+### Interrupt, inspect, and patch
+
+```cpp
+// Pause a live run (produces a checkpoint)
+InterruptResult ir = engine.interrupt(run_id);
+// ir.interrupted == true if the run was paused successfully
+
+// Inspect current run state without modifying it
+RunSnapshot snapshot = engine.inspect(run_id);
+
+// Apply a manual state patch to a paused run
+StatePatch patch;
+patch.updates.push_back(FieldUpdate{kMyKey, int64_t{99}});
+StateEditResult edit = engine.apply_state_patch(run_id, patch, /*branch_id=*/0U);
+// edit.applied == true if the patch was committed
+
+// Continue the paused run (after interrupt or apply_state_patch)
+ResumeResult rr = engine.resume_run(run_id);
+```
+
+`InterruptResult` fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | `RunId` | The paused run |
+| `checkpoint_id` | `CheckpointId` | Checkpoint recorded at pause time |
+| `status` | `ExecutionStatus` | Status after the interrupt |
+| `interrupted` | `bool` | `true` if the run was successfully paused |
+| `message` | `std::string` | Diagnostic message on failure |
+
+`StateEditResult` fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `run_id` | `RunId` | The target run |
+| `branch_id` | `uint32_t` | The branch the patch was applied to |
+| `checkpoint_id` | `CheckpointId` | New checkpoint after the edit |
+| `state_version` | `uint64_t` | State version after the patch |
+| `applied` | `bool` | `true` if the patch was committed |
+| `message` | `std::string` | Diagnostic message on failure |
+
+### Restore from checkpoint
+
+```cpp
+// Resume from a persisted checkpoint (creates a new run from saved snapshot)
+ResumeResult rr = engine.resume(checkpoint_id);
+// rr.resumed == true; rr.run_id is the new RunId
+
+// Continue an already-paused live run without restoring from disk
+ResumeResult rr2 = engine.resume_run(run_id);
+```
+
+The split between `resume(checkpoint_id)` and `resume_run(run_id)` is intentional. `resume` deserializes a `RunSnapshot` from the checkpoint manager and constructs a new live run; `resume_run` re-enqueues the paused branches of a run that is already in memory.
+
+## State and trace access
+
+```cpp
+// Read workflow state for a run's main branch
+const WorkflowState& ws = engine.state(run_id);
+Value v = ws.load(kMyKey); // returns Value variant
+
+// Access the full StateStore (blobs, patch log, knowledge graph, intelligence)
+const StateStore& store = engine.state_store(run_id);
+
+// Knowledge graph
+const KnowledgeGraphStore& kg = engine.knowledge_graph(run_id);
+
+// Trace events (use a cursor for incremental reads)
+StreamCursor cursor;
+std::vector<StreamEvent> events = engine.stream_events(run_id, cursor);
+// cursor.next_sequence advances; subsequent calls return only new events
+```
+
+## ExecutionContext
+
+`ExecutionContext` is passed by reference into every node executor function (`NodeExecutorFn`). It is stack-allocated per step and must not be stored across the call.
+
+```cpp
+struct ExecutionContext {
+    const WorkflowState&     state;             // current branch state (read-only)
+    RunId                    run_id;
+    GraphId                  graph_id;
+    NodeId                   node_id;
+    uint32_t                 branch_id;
+    const std::vector<std::byte>& runtime_config_payload;
+    ScratchArena&            scratch;           // per-step bump allocator
+    BlobStore&               blobs;             // shared blob storage
+    StringInterner&          strings;           // shared string intern table
+    const KnowledgeGraphStore& knowledge_graph; // read-only KG view
+    const IntelligenceStore& intelligence;      // read-only intelligence view
+    const TaskJournal&       task_journal;      // read-only committed effects
+    ToolRegistry&            tools;             // invoke tools from inside a node
+    ModelRegistry&           models;            // invoke models from inside a node
+    TraceSink&               trace;
+    Deadline                 deadline;
+    CancellationToken&       cancel;
+    std::optional<PendingAsyncOperation> pending_async;
+    std::vector<TaskRecord>* recorded_effects;  // pending once-only effect records
+};
+```
+
+### Reading state
+
+```cpp
+NodeResult my_node(ExecutionContext& ctx) {
+    // Read a Value field
+    Value v = ctx.state.load(kMyKey);
+
+    // Read a blob stored as a string
+    if (std::holds_alternative<BlobRef>(v)) {
+        std::string_view text = ctx.blobs.read_string(std::get<BlobRef>(v));
+    }
+
+    return NodeResult::success();
+}
+```
+
+### Invoking tools and models
+
+```cpp
+NodeResult my_node(ExecutionContext& ctx) {
+    // Build a tool request
+    ToolRequest req;
+    req.tool_name = ctx.strings.intern("my_tool");
+    req.input     = ctx.blobs.append_string(R"({"key":"value"})");
+
+    ToolInvocationContext tool_ctx{ctx.blobs, ctx.strings};
+    ToolResponse resp = ctx.tools.invoke(req, tool_ctx);
+
+    if (!resp.ok) {
+        auto cat = classify_tool_response_flags(resp.flags);
+        // handle error category
+        return NodeResult{NodeResult::SoftFail};
+    }
+
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{kResultKey, resp.output});
+    return NodeResult::success(std::move(patch));
+}
+```
+
+### Recorded once-only effects
+
+Use these helpers when a node performs synchronous external work that must not re-execute after a checkpoint restore.
+
+<AccordionGroup>
+  <Accordion title="find_recorded_effect(key)">
+    Looks up a previously committed `TaskRecord` by key in the active run's `TaskJournal` and in any pending recorded effects accumulated this step. Returns `std::optional<RecordedEffectResult>`.
+
+    ```cpp
+    auto existing = ctx.find_recorded_effect("fetch_user_profile");
+    if (existing) {
+        // existing->output is a BlobRef to the committed output
+        // existing->replayed == true
+    }
+    ```
+  </Accordion>
+  <Accordion title="record_blob_effect_once(key, request, producer, flags)">
+    If no prior committed record exists for `key`, calls `producer()` (which must return a `BlobRef`) and appends the result to `recorded_effects`. If a prior record exists, validates the request blob matches and returns the committed output. Throws `std::runtime_error` on request mismatch.
+
+    ```cpp
+    BlobRef request = ctx.blobs.append_string("user_id=42");
+    auto result = ctx.record_blob_effect_once(
+        "fetch_user_profile",
+        request,
+        [&]() -> BlobRef {
+            // call external service ...
+            return ctx.blobs.append_string(response_body);
+        }
+    );
+    // result.replayed == false on first call, true on replay
+    ```
+  </Accordion>
+  <Accordion title="record_text_effect_once(key, request_text, producer, flags)">
+    Convenience wrapper around `record_blob_effect_once` that interns the request as a string blob and expects the producer to return a `std::string`-convertible value.
+
+    ```cpp
+    auto result = ctx.record_text_effect_once(
+        "summarize",
+        "document text goes here",
+        [&]() -> std::string {
+            return call_summarizer(/* ... */);
+        }
+    );
+    ```
+  </Accordion>
+</AccordionGroup>
+
+`RecordedEffectResult` fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `request` | `BlobRef` | The request blob that was stored |
+| `output` | `BlobRef` | The produced or replayed output blob |
+| `flags` | `uint32_t` | Effect-level flags |
+| `replayed` | `bool` | `true` if the result came from a prior committed record |
+
+## NodeResult
+
+Every node executor must return a `NodeResult`. The status field controls how the engine routes execution after the step.
+
+```cpp
+struct NodeResult {
+    enum Status : uint8_t {
+        Success,   // proceed along OnSuccess or Always edges
+        SoftFail,  // proceed along OnSoftFail edges; run stays Running
+        HardFail,  // proceed along OnHardFail edges; run transitions to Failed
+        Waiting,   // branch suspends (async operation or human-in-the-loop)
+        Cancelled  // branch cancelled via CancellationToken
+    } status{Success};
+
+    StatePatch patch;                           // state changes to commit
+    float confidence{1.0F};                     // written into trace events
+    uint32_t flags{0};
+    std::optional<NodeId> next_override;        // force a specific successor node
+    std::optional<PendingAsyncOperation> pending_async;
+};
+```
+
+Convenience constructors:
+
+```cpp
+// Successful step with state changes
+return NodeResult::success(std::move(patch), /*confidence=*/0.95F);
+
+// Waiting (synchronous wait, no async handle)
+return NodeResult::waiting(std::move(patch));
+
+// Waiting on an async tool result
+AsyncToolHandle handle = ctx.tools.begin_invoke_async(req, tool_ctx);
+return NodeResult::waiting_on_tool(handle, std::move(patch));
+
+// Waiting on an async model result
+AsyncModelHandle handle = ctx.models.begin_invoke_async(model_req, model_ctx);
+return NodeResult::waiting_on_model(handle, std::move(patch));
+```
+
+## StatePatch
+
+`StatePatch` is the unit of state mutation. Nodes accumulate changes into a patch and return it inside `NodeResult`; the engine commits the patch atomically after the step.
+
+```cpp
+struct StatePatch {
+    std::vector<FieldUpdate>        updates;         // (StateKey, Value) pairs
+    std::vector<BlobRef>            new_blobs;       // additional blobs to stage
+    std::vector<TaskRecord>         task_records;    // once-only recorded effects
+    KnowledgeGraphPatch             knowledge_graph; // entity and triple writes
+    IntelligencePatch               intelligence;    // task/claim/evidence/decision/memory writes
+    uint32_t                        flags{0};
+};
+```
+
+```cpp
+StatePatch patch;
+
+// Write a scalar
+patch.updates.push_back(FieldUpdate{kCountKey, int64_t{42}});
+
+// Write a blob-backed string
+BlobRef text_ref = ctx.blobs.append_string("some text");
+patch.updates.push_back(FieldUpdate{kTextKey, text_ref});
+
+// Write a knowledge-graph triple
+KnowledgeTripleWrite triple;
+triple.subject_label  = ctx.strings.intern("Agent");
+triple.relation       = ctx.strings.intern("completed");
+triple.object_label   = ctx.strings.intern("Task");
+patch.knowledge_graph.triples.push_back(triple);
+
+return NodeResult::success(std::move(patch));
+```
+
+`FieldUpdate` carries a `StateKey` (a `uint32_t` index) and a `Value` variant. `Value` can hold `std::monostate` (clear the field), `int64_t`, `double`, `bool`, a `BlobRef`, or an `InternedStringId`.
+
+## Adapter HTTP transport seam
+
+Provider-style HTTP adapters share a common transport abstraction defined in `adapters/common/http_transport.h`. Implement `HttpTransport` to inject custom auth, proxies, or mock responses.
+
+```cpp
+struct HttpRequest {
+    std::string              method{"GET"};
+    std::string              url;
+    std::vector<HttpHeader>  headers;
+    std::string              body;
+    uint32_t                 timeout_ms{0};
+};
+
+struct HttpResponse {
+    bool                     transport_ok{false};
+    long                     status_code{0};
+    std::vector<HttpHeader>  headers;
+    std::string              body;
+    std::string              error_message;
+    uint64_t                 latency_ns{0};
+};
+
+using HttpTransport = std::function<HttpResponse(const HttpRequest&)>;
+```
+
+`HttpTransportOptions` bundles a transport function with a base URL, default headers, and auth credentials (bearer token or API key, either literal or from an environment variable):
+
+```cpp
+HttpTransportOptions opts;
+opts.base_url             = "https://api.example.com";
+opts.bearer_token_env_var = "MY_API_TOKEN";
+opts.transport            = my_custom_transport; // or leave empty for default
+```
+
+`invoke_http_transport(options, request, auth_kind)` applies auth injection, merges default headers, and then calls the transport function. The built-in OpenAI-compatible chat adapter, xAI Grok adapter, and HTTP JSON tool adapter all use this seam so that auth, timeout, and header handling remain shared across providers.
+
+## Stream events
+
+After starting a run, call `stream_events` with a `StreamCursor` to read incremental `StreamEvent` records. Each call advances the cursor so subsequent calls return only new events.
+
+```cpp
+StreamCursor cursor;
+StreamReadOptions opts;
+opts.include_subgraphs = true;
+
+while (engine.state(run_id).version.load() /* or check ExecutionStatus */) {
+    auto events = engine.stream_events(run_id, cursor, opts);
+    for (const StreamEvent& ev : events) {
+        // ev.sequence, ev.node_id, ev.node_status, ev.confidence,
+        // ev.patch_count, ev.flags, ev.session_id, ev.namespaces
+    }
+}
+```
+
+`StreamEvent` fields mirror the trace event shape: `sequence`, `run_id`, `graph_id`, `node_id`, `branch_id`, `checkpoint_id`, `node_status`, `confidence`, `patch_count`, `flags`, `session_id`, `session_revision`, and `namespaces` (a `std::vector<StreamNamespaceFrame>` for subgraph paths).
+
+## Proof digests
+
+After a run completes, compute a deterministic audit digest over the final snapshot and its trace sequence:
+
+```cpp
+#include "agentcore/execution/proof.h"
+
+RunSnapshot snapshot = engine.inspect(run_id);
+std::vector<TraceEvent> trace_events = engine.trace().events_for_run(run_id);
+
+RunProofDigest digest = compute_run_proof_digest(snapshot, trace_events);
+// digest.snapshot_digest  — over the serialized RunSnapshot
+// digest.trace_digest     — over the sequence of TraceEvent records
+// digest.combined_digest  — combined value for single-field storage
+```
+
+Alternatively pass a `CheckpointRecord` directly:
+
+```cpp
+auto record = engine.checkpoints().get(last_checkpoint_id);
+if (record) {
+    RunProofDigest d = compute_run_proof_digest(*record, trace_events);
+}
+```

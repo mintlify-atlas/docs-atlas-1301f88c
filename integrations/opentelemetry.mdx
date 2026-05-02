@@ -1,0 +1,196 @@
+---
+title: "OpenTelemetry tracing for AgentCore graphs"
+description: "Emit run spans, node spans, and metrics through the OpenTelemetry SDK from any AgentCore graph invocation using the OpenTelemetryObserver."
+---
+
+AgentCore exposes OpenTelemetry as an opt-in observer. When you pass `telemetry=...` to a graph invocation method, the observer consumes the trace and metadata events AgentCore already records and emits them as spans and metrics through your configured OpenTelemetry SDK providers. Without `telemetry=...`, AgentCore stays on its lean native execution path and adds no observer overhead.
+
+## Install
+
+The `otel` extra bundles `opentelemetry-api` and `opentelemetry-sdk` alongside the AgentCore package:
+
+```bash
+pip install "agentcore-graph[otel]"
+```
+
+You can also install `opentelemetry-api` and `opentelemetry-sdk` directly if that fits your environment. Either way, your application is responsible for configuring exporters, processors, and resource attributes. AgentCore uses the active global tracer and meter providers unless you pass explicit tracer or meter instances into `OpenTelemetryObserver`.
+
+## Basic setup
+
+<Steps>
+  <Step title="Configure your OpenTelemetry SDK">
+    Set up exporters and providers before creating the observer. The example below uses the OTLP exporter, but any SDK-compatible provider works.
+
+    ```python
+    from opentelemetry import trace, metrics
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    trace.set_tracer_provider(tracer_provider)
+
+    meter_provider = MeterProvider(
+        metric_readers=[PeriodicExportingMetricReader(OTLPMetricExporter())]
+    )
+    metrics.set_meter_provider(meter_provider)
+    ```
+  </Step>
+
+  <Step title="Build and compile your graph">
+    ```python
+    from agentcore.graph import END, START, StateGraph
+
+
+    def step(state, config):
+        count = int(state.get("count", 0)) + 1
+        return {"count": count}
+
+
+    def route(state, config):
+        return END if state["count"] >= 2 else "step"
+
+
+    graph = StateGraph(dict, name="otel_demo", worker_count=2)
+    graph.add_node("step", step)
+    graph.add_edge(START, "step")
+    graph.add_conditional_edges("step", route, {END: END, "step": "step"})
+
+    compiled = graph.compile()
+    ```
+  </Step>
+
+  <Step title="Create an observer and invoke the graph">
+    Create one `OpenTelemetryObserver` near application startup and pass it to each invocation.
+
+    ```python
+    from agentcore.observability import OpenTelemetryObserver
+
+
+    observer = OpenTelemetryObserver()
+
+    details = compiled.invoke_with_metadata(
+        {"count": 0},
+        telemetry=observer,
+    )
+    ```
+
+    `OpenTelemetryObserver()` with no arguments picks up the global tracer and meter providers you configured in the previous step.
+  </Step>
+</Steps>
+
+## Quick local check
+
+For a one-off trace without configuring exporters, pass `telemetry=True` directly:
+
+```python
+final_state = compiled.invoke({"count": 0}, telemetry=True)
+```
+
+This constructs a default `OpenTelemetryObserver()` behind the scenes and routes the invocation through the metadata path so spans and metrics are emitted. Use this for local verification; in production, create the observer explicitly so you control provider injection and span options.
+
+## OpenTelemetryObserver constructor
+
+```python
+OpenTelemetryObserver(
+    *,
+    tracer=None,
+    meter=None,
+    tracer_provider=None,
+    meter_provider=None,
+    instrumentation_scope="agentcore",
+    instrumentation_version=None,
+    run_span_name_prefix="agentcore",
+    emit_node_spans=True,
+    emit_metrics=True,
+)
+```
+
+| Parameter | Purpose |
+|---|---|
+| `tracer` | Explicit `opentelemetry.trace.Tracer` instance |
+| `meter` | Explicit `opentelemetry.metrics.Meter` instance |
+| `tracer_provider` | Provider to create the tracer from; falls back to the global provider |
+| `meter_provider` | Provider to create the meter from; falls back to the global provider |
+| `instrumentation_scope` | Tracer/meter scope name (default `"agentcore"`) |
+| `instrumentation_version` | Scope version string; uses the package version if omitted |
+| `run_span_name_prefix` | Prefix for run span names (default `"agentcore"`) |
+| `emit_node_spans` | Emit one child span per node event (default `True`) |
+| `emit_metrics` | Emit run and node counters and histograms (default `True`) |
+
+## Where to attach it
+
+The `telemetry=` keyword is accepted by all invocation methods:
+
+```python
+# Standard invoke
+compiled.invoke({"count": 0}, telemetry=observer)
+
+# Invoke with full run metadata returned
+details = compiled.invoke_with_metadata({"count": 0}, telemetry=observer)
+
+# Pause/resume
+result = compiled.invoke_until_pause_with_metadata({"count": 0}, telemetry=observer)
+resumed = compiled.resume_with_metadata(checkpoint_id, telemetry=observer)
+
+# Streaming
+for event in compiled.stream({"count": 0}, telemetry=observer):
+    ...
+```
+
+Prefer `invoke_with_metadata(...)` when you also want proof, checkpoint, trace, or intelligence metadata returned to your application alongside the telemetry.
+
+## Reduce overhead with run-level-only spans
+
+Disable node spans when you only need run-level observability:
+
+```python
+observer = OpenTelemetryObserver(emit_node_spans=False)
+```
+
+Without node spans, only one span per graph run is emitted. This is useful for high-throughput workloads where per-node span volume is a concern.
+
+## Spans emitted
+
+AgentCore emits:
+
+- **One run span** per `invoke(...)`, `invoke_with_metadata(...)`, `invoke_until_pause_with_metadata(...)`, `resume_with_metadata(...)`, or `stream(...)` call
+- **One child node span** per visible runtime event, unless `emit_node_spans=False`
+
+### Run span attributes
+
+| Attribute | Description |
+|---|---|
+| `agentcore.graph.name` | Name of the compiled graph |
+| `agentcore.operation` | Operation type (e.g. `invoke`, `stream`) |
+| `agentcore.run.id` | Unique run identifier |
+| `agentcore.run.status` | Final run status |
+| `agentcore.run.steps_executed` | Number of steps executed |
+| `agentcore.trace.event_count` | Total trace events in the run |
+| `agentcore.proof.combined_digest` | Cryptographic proof digest |
+| `agentcore.session.id` | Session identifier |
+| `agentcore.session.revision` | Session revision number |
+| `agentcore.namespace.path` | Subgraph namespace path |
+
+### Node span attributes
+
+| Attribute | Description |
+|---|---|
+| `agentcore.node.name` | Node name |
+| `agentcore.node.kind` | Node kind (e.g. `compute`, `tool`, `model`) |
+| `agentcore.result` | Node result summary |
+| `agentcore.duration_ns` | Node execution duration in nanoseconds |
+
+## Metrics emitted
+
+| Metric | Type | Description |
+|---|---|---|
+| `agentcore.run.executions` | Counter | Total graph runs |
+| `agentcore.run.duration` | Histogram | Run duration |
+| `agentcore.trace.events` | Counter | Total trace events |
+| `agentcore.node.executions` | Counter | Total node executions |
+| `agentcore.node.duration` | Histogram | Node execution duration |

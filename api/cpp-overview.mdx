@@ -1,0 +1,217 @@
+---
+title: "C++ API overview: headers, types, and adapter registries"
+description: "A map of the native C++20 public headers, key types, registry surfaces, adapter metadata, and error helpers for embedding AgentCore."
+---
+
+The AgentCore C++ API provides a flat, explicit surface for embedding the agent-graph runtime inside native services, benchmarks, and applications that own their own memory and scheduling environment. All public headers live under `agentcore/include/agentcore/`, and the root CMake interface target is `agentcore::agentcore`. The design is intentionally low-level: graph definitions are structs, nodes return `StatePatch` values, and the engine owns the single commit point. That guarantees replay, checkpoint, and trace behavior that exactly matches what the Python layer produces.
+
+<Note>
+  The C++ API is intended for native embedding. If you are authoring agent workflows from Python, use the Python API (`agentcore.StateGraph`, `CompiledStateGraph`, etc.) instead. The Python bindings run on top of the same native engine described here.
+</Note>
+
+## Key headers
+
+<CardGroup cols={2}>
+  <Card title="core/types.h" icon="code">
+    Common numeric ID aliases (`NodeId`, `EdgeId`, `GraphId`, `StateKey`, `RunId`, `CheckpointId`), the `Value` variant (`std::monostate`, `int64_t`, `double`, `bool`, `BlobRef`, `InternedStringId`), `BlobRef`, `ExecutionStatus`, `ExecutionFrame`, and the `NodeExecutorFn` / `ConditionFn` function pointer typedefs.
+  </Card>
+  <Card title="graph/graph_ir.h" icon="sitemap">
+    `GraphDefinition`, `NodeDefinition`, `EdgeDefinition`, `NodeKind`, `EdgeKind`, `NodePolicyFlag`, `JoinMergeStrategy`, `FieldMergeRule`, `KnowledgeSubscription`, `IntelligenceSubscription`, `SubgraphBinding`, and `NodeMemoizationPolicy`. Also exposes `compile_runtime()`, `bind_outgoing_edges()`, `sort_edges_by_priority()`, and the lookup helpers on `GraphDefinition`.
+  </Card>
+  <Card title="state/state_store.h" icon="database">
+    `WorkflowState` (segmented value array with per-field revisions), `StatePatch` (field updates, blob refs, task records, knowledge-graph and intelligence writes), `BlobStore`, `StringInterner`, `PatchLog`, `PatchLogEntry`, `StateStore`, and `StateApplyResult`. `StateStore` owns all sub-stores and is the primary state container carried by each branch at runtime.
+  </Card>
+  <Card title="state/intelligence/model.h" icon="brain">
+    Intelligence record types: `IntelligenceTaskStatus`, `IntelligenceClaimStatus`, `IntelligenceDecisionStatus`, `IntelligenceMemoryLayer`, and their name/parse helpers. Also declares `IntelligencePatch`, `IntelligenceDeltaSummary`, and the `IntelligenceStore` that `StateStore` owns.
+  </Card>
+  <Card title="state/knowledge_graph.h" icon="share-nodes">
+    `KnowledgeEntity`, `KnowledgeTriple`, `KnowledgeEntityWrite`, `KnowledgeTripleWrite`, `KnowledgeGraphPatch`, `KnowledgeGraphDeltaSummary`, and `KnowledgeGraphStore`. The store exposes `upsert_entity`, `upsert_triple`, `match`, `outgoing`, `incoming`, and `neighbors` queries. All knowledge data is part of runtime state, not a sidecar service.
+  </Card>
+  <Card title="runtime/node_runtime.h" icon="bolt">
+    `ExecutionContext` (per-step view of state, blobs, strings, knowledge graph, intelligence store, task journal, tool and model registries, trace sink, deadline, and cancellation token), `NodeResult` (status, patch, confidence, flags, optional next-node override), `RecordedEffectResult`, `ScratchArena`, `Deadline`, and `CancellationToken`.
+  </Card>
+  <Card title="runtime/scheduler.h" icon="list-check">
+    `Scheduler`, `WorkQueue`, `WorkerPool`, and `AsyncCompletionQueue`. `Scheduler` owns the work queue, the async completion queue, and an optional thread pool. `ScheduledTask` carries `(run_id, node_id, branch_id, ready_at_ns)`.
+  </Card>
+  <Card title="execution/engine.h" icon="engine">
+    `ExecutionEngine`, `ExecutionEngineOptions`, `InputEnvelope`, `StepResult`, `RunResult`, `ResumeResult`, `InterruptResult`, `StateEditResult`, `CheckpointPolicy`, and `RunCaptureOptions`. This is the single class callers construct to start and drive runs.
+  </Card>
+  <Card title="execution/checkpoint.h" icon="floppy-disk">
+    `ExecutionProfile` (`Strict`, `Balanced`, `Fast`), `Checkpoint`, `CheckpointRecord`, `CheckpointPayloadKind`, `RunSnapshot`, `BranchSnapshot`, `TraceEvent`, `CheckpointStorageBackend` (pure-virtual interface), `CheckpointManager`, and `TraceSink`. Factory functions `make_file_checkpoint_storage` and `make_sqlite_checkpoint_storage` produce storage backends.
+  </Card>
+  <Card title="execution/proof.h" icon="shield-check">
+    `RunProofDigest` (`snapshot_digest`, `trace_digest`, `combined_digest`) and the two overloads of `compute_run_proof_digest`. Use these to produce deterministic digests over a run snapshot and its trace sequence for audit and replay verification.
+  </Card>
+</CardGroup>
+
+## Key native types
+
+The table below lists the types you interact with most directly when building against the C++ surface.
+
+| Type | Header | Purpose |
+|------|--------|---------|
+| `GraphDefinition` | `graph/graph_ir.h` | Immutable compiled workflow: nodes, edges, routing tables, merge rules, subscription indexes |
+| `NodeDefinition` | `graph/graph_ir.h` | Node kind, policy flags, executor function pointer, retry limit, timeout, outgoing edge range |
+| `EdgeDefinition` | `graph/graph_ir.h` | Routing relationship, `EdgeKind` (`Always`, `OnSuccess`, `OnSoftFail`, `OnHardFail`, `Conditional`), optional condition function, priority |
+| `ExecutionEngine` | `execution/engine.h` | Owns the scheduler, registries, checkpoint manager, and all active run state |
+| `ExecutionContext` | `runtime/node_runtime.h` | Passed by reference into every node executor; provides read-only state, mutable blobs/strings, registries, and the recorded-effect seam |
+| `NodeResult` | `runtime/node_runtime.h` | Returned by every node executor: `status`, `patch`, `confidence`, `flags`, optional `next_override` |
+| `StatePatch` | `state/state_store.h` | Carries `FieldUpdate` list, `BlobRef` list, `TaskRecord` list, `KnowledgeGraphPatch`, and `IntelligencePatch` |
+| `WorkflowState` | `state/state_store.h` | Segmented value array with per-field revision counters; `Value` is a `std::variant` over `std::monostate`, `int64_t`, `double`, `bool`, `BlobRef`, `InternedStringId` |
+| `StateStore` | `state/state_store.h` | Owns `WorkflowState`, `BlobStore`, `StringInterner`, `PatchLog`, `KnowledgeGraphStore`, `IntelligenceStore`, and `TaskJournal` |
+| `InterruptResult` | `execution/engine.h` | `run_id`, `checkpoint_id`, `status`, `interrupted` flag, `message` |
+| `StateEditResult` | `execution/engine.h` | `run_id`, `branch_id`, `checkpoint_id`, `state_version`, `applied` flag, `message` |
+| `RunSnapshot` | `execution/checkpoint.h` | Full serializable run state: graph, status, branch snapshots, join scopes, reactive frontier state, pending tasks |
+| `TraceEvent` | `execution/checkpoint.h` | Per-step trace record: `sequence`, `ts_start_ns`, `ts_end_ns`, `run_id`, `graph_id`, `node_id`, `branch_id`, `checkpoint_id`, `result`, `confidence`, `patch_count`, `flags` |
+| `RunProofDigest` | `execution/proof.h` | `snapshot_digest`, `trace_digest`, `combined_digest` — stable 64-bit digests for audit and replay verification |
+
+## Defining and compiling a graph
+
+A `GraphDefinition` is a plain struct you populate before passing it to the engine. Call `compile_runtime()` after all nodes and edges are in place; the engine also calls this automatically on first use.
+
+```cpp
+#include "agentcore/execution/engine.h"
+#include "agentcore/graph/graph_ir.h"
+
+using namespace agentcore;
+
+NodeResult my_node(ExecutionContext& ctx) {
+    StatePatch patch;
+    patch.updates.push_back(FieldUpdate{0, ctx.blobs.append_string("result")});
+    return NodeResult::success(std::move(patch), 1.0F);
+}
+
+NodeResult stop_node(ExecutionContext&) {
+    return NodeResult::success();
+}
+
+GraphDefinition build_graph() {
+    GraphDefinition graph;
+    graph.id = 1;
+    graph.name = "example";
+    graph.entry = 1;
+
+    graph.nodes = {
+        NodeDefinition{1, NodeKind::Compute, "my_node",   0U, 0U, 0U, my_node,   {}},
+        NodeDefinition{2, NodeKind::Control, "stop_node",
+            node_policy_mask(NodePolicyFlag::StopAfterNode),
+            0U, 0U, stop_node, {}}
+    };
+    graph.edges = {
+        EdgeDefinition{1, 1, 2, EdgeKind::OnSuccess, nullptr, 100U}
+    };
+    graph.bind_outgoing_edges(1, {1});
+    graph.sort_edges_by_priority();
+    return graph;
+}
+```
+
+### `NodePolicyFlag` values
+
+| Flag | Effect |
+|------|--------|
+| `AllowFanOut` | Node may produce parallel branches |
+| `StopAfterNode` | Execution halts after this node completes |
+| `JoinIncomingBranches` | Node merges all arriving branches before executing |
+| `CreateJoinScope` | Opens a new join scope for downstream branches |
+| `ReactToKnowledgeGraph` | Node is re-triggered on matching knowledge-graph writes |
+| `ReactToIntelligence` | Node is re-triggered on matching intelligence writes |
+
+### `JoinMergeStrategy` values
+
+When a join node receives patches from multiple branches, the engine reconciles conflicting field writes using the strategy declared on each `FieldMergeRule`: `RequireEqual`, `RequireSingleWriter`, `LastWriterWins`, `FirstWriterWins`, `SumInt64`, `MaxInt64`, `MinInt64`, `LogicalOr`, `LogicalAnd`, `ConcatSequence`, or `MergeMessages`.
+
+## Tool and model registration
+
+Registries are owned by the engine and exposed through accessor methods. Register handlers before starting any run.
+
+```cpp
+// Register a tool
+engine.tools().register_tool("my_tool", [](const ToolRequest& req, ToolInvocationContext& ctx) {
+    ToolResponse resp;
+    resp.ok = true;
+    resp.output = ctx.blobs.append_string("tool_output");
+    return resp;
+});
+
+// Register a tool with policy and metadata
+ToolPolicy policy;
+policy.retry_limit = 2;
+policy.timeout_ms = 5000;
+engine.tools().register_tool("my_tool", policy, AdapterMetadata{}, handler);
+
+// Register a model
+engine.models().register_model("my_model", [](const ModelRequest& req, ModelInvocationContext& ctx) {
+    ModelResponse resp;
+    resp.ok = true;
+    resp.output = ctx.blobs.append_string("model_output");
+    resp.confidence = 0.9F;
+    return resp;
+});
+
+// Inspect registered adapters
+auto tool_spec = engine.tools().describe_tool("my_tool");
+auto model_spec = engine.models().describe_model("my_model");
+```
+
+Handlers receive a `ToolInvocationContext` or `ModelInvocationContext` giving access to the shared `BlobStore` and `StringInterner`. Return values carry `ok`, `output` (a `BlobRef`), `flags`, `attempts`, and `latency_ns`. Model responses additionally carry `confidence` and `token_usage`.
+
+## Adapter metadata and capabilities
+
+`AdapterMetadata` describes how the engine should interpret an adapter entry in the registry. All built-in adapters register metadata by default.
+
+```cpp
+AdapterMetadata meta;
+meta.provider        = "my_company";
+meta.implementation  = "my_tool_v1";
+meta.display_name    = "My Tool";
+meta.transport       = AdapterTransportKind::Http;
+meta.auth            = AdapterAuthKind::BearerToken;
+meta.capabilities    = kAdapterCapabilitySync
+                     | kAdapterCapabilityExternalNetwork
+                     | kAdapterCapabilityStructuredRequest;
+meta.request_format  = "json";
+meta.response_format = "json";
+
+engine.tools().register_tool("my_tool", policy, meta, handler);
+
+// Query a capability at runtime
+bool is_checkpoint_safe = adapter_has_capability(meta, kAdapterCapabilityCheckpointSafe);
+```
+
+### Capability flags
+
+| Flag | Meaning |
+|------|---------|
+| `kAdapterCapabilitySync` | Handler executes synchronously |
+| `kAdapterCapabilityAsync` | Handler supports async invocation |
+| `kAdapterCapabilityStreaming` | Handler can stream partial output |
+| `kAdapterCapabilityStructuredRequest` | Accepts structured (JSON) input |
+| `kAdapterCapabilityStructuredResponse` | Returns structured (JSON) output |
+| `kAdapterCapabilityCheckpointSafe` | Safe to replay after checkpoint restore |
+| `kAdapterCapabilityExternalNetwork` | Makes outbound network calls |
+| `kAdapterCapabilityLocalFilesystem` | Reads or writes local files |
+| `kAdapterCapabilityJsonSchema` | Accepts a JSON schema for output |
+| `kAdapterCapabilityToolCalling` | Supports model-side tool calling |
+| `kAdapterCapabilitySql` | Executes SQL queries |
+| `kAdapterCapabilityChatMessages` | Accepts chat-message-style input |
+
+Helper functions `adapter_transport_name(AdapterTransportKind)` and `adapter_auth_name(AdapterAuthKind)` return stable string names for logging and introspection.
+
+## Stable error categorization
+
+Tool and model responses carry a `flags` field. Use the classification helpers to map raw flags to a stable category instead of testing individual bits.
+
+```cpp
+ToolResponse resp = engine.tools().invoke(request, ctx);
+ToolErrorCategory category = classify_tool_response_flags(resp.flags);
+std::string_view name = tool_error_category_name(category);
+// name: "none" | "missing_handler" | "validation" | "limits"
+//       "timeout" | "unsupported" | "handler_exception" | "retry_exhausted"
+
+ModelResponse mresp = engine.models().invoke(model_req, mctx);
+ModelErrorCategory mcat = classify_model_response_flags(mresp.flags);
+std::string_view mname = model_error_category_name(mcat);
+```
+
+The same category set applies to both tool and model responses: `none`, `missing_handler`, `validation`, `limits`, `timeout`, `unsupported`, `handler_exception`, `retry_exhausted`.

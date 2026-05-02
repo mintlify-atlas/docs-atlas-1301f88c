@@ -1,0 +1,529 @@
+---
+title: "AgentCore runtime model: patches, sessions, and context"
+description: "How AgentCore executes graphs: patch-based state, deterministic commits, scheduling, checkpointing, persistent sessions, and context assembly."
+---
+
+AgentCore is organized around a narrow execution kernel with one job: execute a node, apply a patch, choose edges, schedule work, checkpoint, and continue or stop. Everything else — prompts, tool calls, model selection, retrieval strategies — lives at the edges. This page explains the mechanics of that kernel: how state changes travel from a node callback through a commit point, how the scheduler tracks runnable work, how checkpoints and persistent sessions are maintained, and how structured intelligence records and context assembly fit into the same execution path.
+
+## Core separation
+
+The runtime is organized into four layers with explicit boundaries:
+
+- **Graph IR** holds immutable workflow structure: nodes, edges, policies, and metadata compiled at `graph.compile()` time.
+- **State storage** owns typed fields, blobs, patch history, structured intelligence records, and knowledge-graph data.
+- **Runtime** owns Python callbacks, tool and model registries, scheduling, and async completions.
+- **Execution** owns stepping, patch commit, trace emission, checkpointing, and resume.
+
+This separation keeps the engine responsible for semantics. It does not contain application-specific prompt logic, hardcoded tool behavior, hardcoded model behavior, or graph-specific policy hacks.
+
+<AccordionGroup>
+
+  <Accordion title="State patch model">
+    Nodes do not mutate global workflow state. They return a `NodeResult` containing a status, a `StatePatch`, optional confidence flags, and an optional routing override. The engine applies that patch at a single commit point.
+
+    In Python this surfaces as a plain dict return from a node callback:
+
+    ```python
+    def step(state, config):
+        return {"count": int(state.get("count", 0)) + 1}
+    ```
+
+    The runtime normalizes that mapping into a native state patch and commits it once for the step. That single commit point is what keeps trace emission, replay, and checkpoint generation in sync with state mutation.
+
+    The state layer separates concerns intentionally:
+
+    - **Hot fields** — small indexed values in `WorkflowState`
+    - **Blobs** — larger payloads such as prompts and model outputs in `BlobStore`
+    - **Intelligence records** — tasks, claims, evidence, decisions, and memories in `IntelligenceStore`
+    - **Knowledge-graph triples** — entity and triple storage in `KnowledgeGraphStore`
+    - **Task journal** — recorded synchronous outcomes for once-only effects
+
+    Structured stores follow the same hot/cold split. Knowledge-graph and intelligence deltas still commit through `StatePatch`, but the state store applies them in place when the underlying store is uniquely owned — preserving observable patch semantics while avoiding clone-then-swap work on knowledge-heavy runs.
+
+    <Note>
+      One deliberate exception at the node boundary: recorded synchronous effects. A node can ask the runtime to run a keyed effect once and persist its output. That effect record is committed by the engine together with the step patch, keeping once-only work inside the same checkpoint and proof model.
+    </Note>
+  </Accordion>
+
+  <Accordion title="Execution profiles">
+    `ExecutionEngineOptions` makes durability and observability policy explicit through `ExecutionProfile`. State patches, routing, replay, persistent sessions, and public stream ordering remain the same in every mode. What changes is how much durability and observability work stays directly on the hot step path.
+
+    | Profile | Checkpoint persistence | Trace retention |
+    | --- | --- | --- |
+    | **Strict** | Synchronous, on the step path | Unbounded |
+    | **Balanced** | Background writer, after commit | Per-run segmented traces |
+    | **Fast** | Metadata-first, decoupled | Bounded |
+
+    In `Balanced` and `Fast`, the engine still assigns checkpoint IDs and commits state synchronously. Durable writes are flushed through a background append-oriented writer rather than forcing a synchronous full persistence round-trip for every checkpoint record.
+
+    <Tip>
+      Start with `Balanced` for most production workflows. Use `Strict` when you need synchronous durability guarantees, and `Fast` when metadata overhead is the dominant cost on short hot-path runs.
+    </Tip>
+  </Accordion>
+
+  <Accordion title="Scheduling and concurrency">
+    Concurrency is explicit, not implicit. The scheduler manages three concerns separately:
+
+    - **Per-run ready queues** for immediately runnable work
+    - **A delayed-task heap** for future `ready_at_ns` wakeups
+    - **Async completion queues** for tool and model waits
+
+    Fan-out only happens when the graph definition makes it possible. Async behavior is primarily for external work such as tool calls, model calls, or waiting nodes.
+
+    One important determinism rule at the async boundary: a grouped async wait is treated as one checkpointed frontier, not a race between unrelated handles. The scheduler only makes that task runnable once the full registered wait group is complete. This matters for resumable subgraphs, where replay should follow the same child frontier after restore.
+
+    In Python, `worker_count` controls native worker parallelism inside one compiled graph. Separately, `abatch(...)` allows multiple invocations to be active concurrently at the outer API layer:
+
+    ```python
+    # worker_count controls in-graph parallelism at compile time
+    graph = StateGraph(dict, name="pipeline", worker_count=4)
+    compiled = graph.compile()
+
+    # abatch runs multiple invocations concurrently
+    results = await compiled.abatch([{"count": 0}, {"count": 5}, {"count": 10}])
+    ```
+  </Accordion>
+
+  <Accordion title="Deterministic node memoization">
+    The runtime includes a memoization seam for deterministic nodes. When a node declares `deterministic=True` and a set of `read_keys`, the runtime caches its result against the current revision counters of those declared keys plus the runtime config payload.
+
+    ```python
+    graph.add_node(
+        "score",
+        score_candidate,
+        deterministic=True,
+        read_keys=["candidate_id", "rubric_version"],
+        cache_size=32,
+    )
+    ```
+
+    When any declared key changes, branch-local memo entries that depend on it are invalidated. The cache lives in the native runtime — not in Python — which means it participates in the same replay boundary as other state.
+
+    <Warning>
+      Reactive nodes, subgraph nodes, tool nodes, and model nodes are intentionally excluded from this first memoization seam. Knowledge-graph or intelligence writes clear the branch-local memo cache rather than trying to derive a partial dependency key.
+    </Warning>
+  </Accordion>
+
+</AccordionGroup>
+
+## Fan-out and joins
+
+Branching and joins are modeled in graph structure and node policy rather than through hidden runtime conventions. Fan-out nodes create explicit parallel branches; join nodes wait for incoming branches and apply merge rules.
+
+The Python layer exposes first-class helpers:
+
+```python
+import operator
+from typing import Annotated, TypedDict
+
+from agentcore.graph import START, StateGraph
+
+
+class ReviewState(TypedDict, total=False):
+    score: Annotated[int, operator.add]
+    notes: Annotated[list[str], operator.add]
+    approved: Annotated[bool, operator.or_]
+    summary: str
+
+
+graph = StateGraph(ReviewState, name="schema_join", worker_count=4)
+graph.add_fanout("fanout")
+graph.add_node("left", lambda state, config: {"score": 1, "notes": ["left"], "approved": False})
+graph.add_node("right", lambda state, config: {"score": 2, "notes": ["right"], "approved": True})
+graph.add_join(
+    "join",
+    lambda state, config: {
+        "summary": f"{state['score']}::{','.join(state['notes'])}::{state['approved']}",
+    },
+)
+graph.add_edge(START, "fanout")
+graph.add_edge("fanout", "left")
+graph.add_edge("fanout", "right")
+graph.add_edge(["left", "right"], "join")
+graph.set_finish_point("join")
+```
+
+The currently supported merge strategies are: `require_equal`, `require_single_writer`, `last_writer_wins`, `first_writer_wins`, `sum_int64`, `max_int64`, `min_int64`, `logical_or`, `logical_and`, `concat_sequence`, and `merge_messages`.
+
+`concat_sequence` is the native fast path behind `Annotated[list[T], operator.add]`. `merge_messages` is the native fast path behind `MessagesState` — messages with matching non-empty `id` values replace the existing record in place, while messages without ids append.
+
+## Persistent session lifecycle
+
+Subgraphs support two session modes:
+
+- **Ephemeral** — every invocation gets a fresh child snapshot (default).
+- **Persistent** — a child snapshot is stored and reused by `(subgraph node, session_id)`.
+
+For persistent sessions, the lifecycle is:
+
+1. Resolve `session_id` from the parent state field configured by `session_id_from`.
+2. Restore the last committed child snapshot for that session, or create a fresh child snapshot if none exists.
+3. Overlay current input bindings onto the child state before execution.
+4. Run the child graph from its entry point.
+5. On successful child completion, commit the full child snapshot into the parent-managed session table.
+6. Apply declared output bindings from the committed child snapshot back into parent state.
+
+```python
+from agentcore.graph import END, START, StateGraph
+
+
+specialist = StateGraph(dict, name="specialist", worker_count=2)
+specialist.add_node("answer", lambda state, config: {"visits": int(state.get("visits", 0)) + 1})
+specialist.add_edge(START, "answer")
+specialist.add_edge("answer", END)
+
+parent = StateGraph(dict, name="parent", worker_count=4)
+parent.add_subgraph(
+    "specialist_session",
+    specialist,
+    namespace="specialist_session",
+    inputs={"specialist_id": "session_id", "prompt": "query"},
+    outputs={"visits": "visits"},
+    session_mode="persistent",
+    session_id_from="specialist_id",
+)
+```
+
+Two rules are intentionally strict:
+
+- Concurrent reuse of the same `(subgraph node, session_id)` within one run is rejected rather than merged.
+- Child session snapshots only commit on successful completion — failure, cancellation, and waiting leave the last committed snapshot unchanged.
+
+<Info>
+  Checkpoint snapshots persist both pending subgraph work and the committed child-session table, including `session_id` and `session_revision`. Cold restore and in-memory resume follow the same lifecycle.
+</Info>
+
+Knowledge-graph propagation is explicit. Ephemeral subgraphs get a per-invocation fork when `propagate_knowledge_graph=True`. Persistent sessions seed their child-local knowledge graph only when the session is first created. Later invocations reuse the committed child-local graph. Parent and child knowledge graphs do not automatically merge outside explicit state output bindings.
+
+The same isolation applies to intelligence state: child intelligence records are part of the child snapshot, not a shared mutable parent side table.
+
+## Traces, checkpoints, and proofs
+
+The runtime records three related but distinct artifacts:
+
+- **Trace events** — append-only observability records, one per step.
+- **Checkpoint records** — resumable snapshots for pause, restore, and replay.
+- **Proof digests** — cryptographic digests over snapshot and trace sequences for cross-run comparison.
+
+Public stream events are derived from runtime trace data rather than maintained as a second event pipeline. That keeps the observable surface aligned with the execution record.
+
+Checkpoint persistence is behind a storage backend seam, with binary file-backed and SQLite-backed options available. The `TaskJournal` is serialized as part of the state layer, so a restored run can reuse previously committed synchronous outcomes without re-executing the underlying side effect.
+
+The engine exposes an explicit operational flow for intentional intervention:
+
+```python
+# Pause a live run and capture a resumable snapshot
+engine.interrupt(run_id)
+
+# Inspect current state
+snapshot = engine.inspect(run_id)
+
+# Resume from in-memory paused state
+engine.resume_run(run_id)
+
+# Restore from persisted checkpoint
+engine.resume(checkpoint_id)
+```
+
+From Python, pause and resume work through the compiled graph surface:
+
+```python
+from agentcore.graph import Command
+
+
+def human_review(state, config):
+    if not state.get("approved", False):
+        return Command(update={"approved": False}, wait=True)
+    return {"done": True}
+
+
+paused = compiled.invoke_until_pause_with_metadata({"approved": False})
+resumed = compiled.resume_with_metadata(paused["summary"]["checkpoint_id"])
+```
+
+## Intelligence state
+
+AgentCore includes a first-class intelligence state model inside the native state subsystem. Rather than treating agent reasoning artifacts as conventions layered on generic fields, the runtime stores them as typed records with deterministic commit timing, checkpoint and replay behavior, and subgraph session isolation.
+
+The implemented record types are: **tasks**, **claims**, **evidence**, **decisions**, and **memories**.
+
+Python nodes access these through `runtime.intelligence`:
+
+```python
+from agentcore.graph import END, START, RuntimeContext, StateGraph
+
+
+def analyze(state, config, runtime: RuntimeContext):
+    runtime.intelligence.upsert_task(
+        "triage",
+        title="Inspect inbound request",
+        owner="planner",
+        status="in_progress",
+        priority=4,
+        details={"request_id": state["request_id"]},
+    )
+    runtime.intelligence.upsert_claim(
+        "needs-escalation",
+        subject="request",
+        relation="requires",
+        object="escalation",
+        status="proposed",
+        confidence=0.74,
+    )
+    runtime.intelligence.add_evidence(
+        "ticket-snippet",
+        kind="ticket",
+        source="support",
+        claim_key="needs-escalation",
+        content={"excerpt": state["excerpt"]},
+        confidence=0.82,
+    )
+    runtime.intelligence.record_decision(
+        "send-to-review",
+        task_key="triage",
+        claim_key="needs-escalation",
+        status="selected",
+        confidence=0.91,
+    )
+    runtime.intelligence.remember(
+        "customer-tone",
+        layer="working",
+        scope="request",
+        content={"tone": "urgent"},
+        importance=0.6,
+    )
+
+    next_task = runtime.intelligence.next_task(owner="planner")
+    return {"next_task_key": None if next_task is None else next_task["key"]}
+```
+
+<AccordionGroup>
+
+  <Accordion title="Commit and read semantics">
+    Intelligence writes follow the same commit rule as other state:
+
+    1. The node stages a write into `StatePatch::intelligence`.
+    2. The engine commits that patch once for the step.
+    3. Checkpoints, traces, proof digests, and replay all observe the same committed result.
+
+    On the Python surface, `runtime.intelligence.snapshot()` overlays any staged writes onto the current store before returning, so a callback can verify read-your-own-writes within the same node execution without a second mutable channel.
+  </Accordion>
+
+  <Accordion title="Ranking rules">
+    The operational query surface uses explicit, deterministic ranking:
+
+    - **Task agendas** rank by status class (`in_progress`, `open`, `blocked`, `completed`, `cancelled`), then by descending priority, confidence, and stable id.
+    - **Supporting claims** rank by aligned support first, then total support, claim status class, confidence, and stable id.
+    - **Action candidates** rank by direct task anchor, direct support alignment from linked evidence/decisions/memories, task status class, total linked support, and priority.
+    - **Memory recall** ranks by descending importance, then ascending stable id.
+    - **Focus retrieval** seeds from direct anchors plus the current task agenda, memory recall, and explicit filters, then expands one bounded related set through task/claim links.
+
+    That means a workflow can ask for "the next task" or "the top memories" without relying on Python-side sorts or implicit object insertion order.
+  </Accordion>
+
+  <Accordion title="Intelligence-reactive nodes">
+    Graphs can declare intelligence-reactive nodes using `intelligence_subscriptions`. When a committed intelligence delta matches the subscription, the runtime schedules the subscribed node through the same reactive frontier machinery:
+
+    ```python
+    from agentcore.graph import IntelligenceSubscription, START, StateGraph
+
+
+    def write_claim(state, config, runtime):
+        runtime.intelligence.upsert_claim(
+            "claim:reactive",
+            subject="agentcore",
+            relation="supports",
+            object="reactive_runtime",
+            status="supported",
+        )
+        return {}
+
+
+    def react_to_supported_claim(state, config):
+        return {"reactive_seen": True}
+
+
+    graph = StateGraph(dict, name="intelligence_reactive")
+    graph.add_node("write", write_claim)
+    graph.add_node(
+        "react",
+        react_to_supported_claim,
+        kind="aggregate",
+        stop_after=True,
+        intelligence_subscriptions=[
+            IntelligenceSubscription(
+                subject="agentcore",
+                relation="supports",
+                object="reactive_runtime",
+            ),
+        ],
+    )
+    graph.add_edge(START, "write")
+    ```
+
+    Subscriptions are compiled into native graph metadata. The trigger only fires after the intelligence patch is committed. Duplicate no-op writes do not retrigger the frontier.
+  </Accordion>
+
+</AccordionGroup>
+
+## Context assembly
+
+AgentCore exposes a graph-native context assembly layer. A node declares a `ContextSpec` at graph-build time and calls `runtime.context.view()` during execution. The runtime assembles a deterministic context view from state already available to the node — no hidden model calls, no implicit memory mutations.
+
+Sources the view can include:
+
+- Message history from the configured message state field (`messages.recent`, `messages.all`)
+- Task, claim, evidence, decision, and memory records through the native intelligence query surface
+- Native knowledge-graph triples through `runtime.knowledge`
+- Selected state fields through `state.<field>` selectors
+
+```python
+from agentcore.graph import ContextSpec, END, START, StateGraph
+
+
+def prepare(state, config, runtime):
+    runtime.knowledge.upsert_triple(
+        "AgentCore",
+        "stores",
+        "native knowledge triples",
+        payload={"source": "quickstart"},
+    )
+    runtime.intelligence.upsert_claim(
+        "claim:native-runtime",
+        subject="agentcore",
+        relation="uses",
+        object="native runtime",
+        status="supported",
+        confidence=0.9,
+    )
+    return {
+        "messages": [{"role": "user", "content": state["question"]}],
+    }
+
+
+def answer(state, config, runtime):
+    context = runtime.context.view()
+    prompt = context.to_prompt(system="Answer with cited context.")
+    return {
+        "prompt": prompt,
+        "context_digest": context.digest,
+        "context_items": len(context),
+    }
+
+
+graph = StateGraph(dict, name="context_demo")
+graph.add_node("prepare", prepare)
+graph.add_node(
+    "answer",
+    answer,
+    context=ContextSpec(
+        goal_key="question",
+        include=["messages.recent", "claims.supported", "evidence.relevant", "knowledge.neighborhood"],
+        budget_tokens=1200,
+        require_citations=True,
+    ),
+)
+graph.add_edge(START, "prepare")
+graph.add_edge("prepare", "answer")
+graph.add_edge("answer", END)
+
+details = graph.compile().invoke_with_metadata({"question": "What is AgentCore?"})
+print(details["state"]["context_digest"])
+```
+
+For intelligence and native knowledge selectors, context assembly uses a native ranking path:
+
+1. `ContextSpec` is compiled into a `ContextQueryPlan`.
+2. The runtime builds typed adjacency over `IntelligenceStore` records and `KnowledgeGraphStore` triples.
+3. Deterministic integer activation scores propagate across direct task links, claim links, and semantic subject/relation/object links.
+4. Motif-aware boosts prefer supported structures: claim + evidence, claim + selected decision, linked memory, and exact claim-to-knowledge-triple matches.
+5. The ranked set is pruned with a kind-balanced top-k so one dense record type does not crowd out the rest of the context.
+
+The returned `ContextView` includes ordered context items, citation ids, provenance records, approximate budget accounting, conflict metadata for claims that disagree on the same subject/relation, a stable digest, and rendering helpers:
+
+```python
+# Render as a text prompt string
+prompt_text = context.to_prompt(system="You are a helpful assistant.")
+
+# Render as a list of chat messages
+messages = context.to_messages()
+
+# Render as adapter-facing dict or message list
+payload = context.to_model_input(mode="text")  # or "messages" or "dict"
+```
+
+<Info>
+  `ContextView.to_prompt(...)` returns text. `ContextView.to_messages(...)` returns chat-style messages. The active Python runtime view caches the compiled native context graph result — repeated `runtime.context.view()` calls inside the same callback reuse that cache until staged intelligence or knowledge writes change the cache fingerprint.
+</Info>
+
+## External graph stores
+
+Native knowledge-graph state is part of the runtime state model. When the source of truth lives in an external database, the graph-store layer provides an explicit bridge: register a store on the compiled graph, hydrate the triples a node needs into `runtime.knowledge`, and then context assembly, checkpoints, subgraphs, and replay see those triples as normal runtime state.
+
+```python
+from agentcore.graph import ContextSpec, END, START, StateGraph
+
+
+def load_ops_graph(state, config, runtime):
+    loaded = runtime.knowledge.load_neighborhood(
+        "Incident",
+        store="ops_graph",
+        depth=2,
+        limit=20,
+    )
+    return {"loaded_triples": len(loaded["triples"])}
+
+
+graph = StateGraph(dict, name="graph_store_demo")
+graph.add_node("load", load_ops_graph)
+graph.add_edge(START, "load")
+graph.add_edge("load", END)
+
+compiled = graph.compile()
+compiled.graph_stores.register_memory(
+    "ops_graph",
+    triples=[
+        ("Incident", "affects", "checkout API"),
+        ("checkout API", "depends_on", "payment service"),
+    ],
+)
+
+result = compiled.invoke({"question": "What is affected?"})
+```
+
+For Neo4j, install the optional dependency and register the adapter:
+
+```bash
+python3 -m pip install "agentcore-graph[neo4j]"
+```
+
+```python
+compiled.graph_stores.register_neo4j(
+    "ops_graph",
+    uri="bolt://localhost:7687",
+    auth=("neo4j", "password"),
+)
+```
+
+If a node creates new runtime triples that should be reflected in the external store, sync them explicitly using `runtime.knowledge.sync_to_store(...)`. This explicit load/sync boundary is also a replay boundary: external graph databases are integration state, and runtime knowledge becomes deterministic AgentCore state only after a node hydrates it.
+
+<Warning>
+  Never assume that triples in an external graph store are available to context assembly or replay without first calling `runtime.knowledge.load_neighborhood(...)` or `runtime.knowledge.load_query(...)` inside a node. Hydration is intentionally explicit.
+</Warning>
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Run your first graph and explore streaming and metadata in minutes.
+  </Card>
+  <Card title="MCP integration" icon="plug" href="/integrations/mcp">
+    Connect MCP servers and expose AgentCore tools through the MCP protocol.
+  </Card>
+  <Card title="Graph stores" icon="database" href="/integrations/graph-stores">
+    Register InMemoryGraphStore or Neo4jGraphStore adapters for knowledge hydration.
+  </Card>
+  <Card title="OpenTelemetry" icon="chart-line" href="/integrations/opentelemetry">
+    Emit run spans, node spans, and metrics using the standard OpenTelemetry API.
+  </Card>
+</CardGroup>

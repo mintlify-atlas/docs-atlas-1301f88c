@@ -1,0 +1,116 @@
+{
+  "projectType": "framework",
+  "projectName": "AgentCore",
+  "projectDescription": "A native C++20 agent-graph runtime with a Python API for building deterministic, inspectable, and durable multi-agent workflows.",
+  "theme": "aspen",
+  "primaryColor": "#242b2c",
+  "lightColor": "#6a6a6d",
+  "darkColor": "#ebeaea",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "concepts/runtime-model"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/state-and-reducers",
+              "guides/subgraphs-and-sessions",
+              "guides/context-assembly",
+              "guides/intelligence-state",
+              "guides/patterns"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/mcp",
+              "integrations/graph-stores",
+              "integrations/opentelemetry"
+            ]
+          },
+          {
+            "group": "Migration & Operations",
+            "pages": [
+              "migration/from-langgraph",
+              "operations/building-from-source",
+              "operations/validation-and-benchmarks"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/design-lineage",
+              "concepts/performance"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Python API",
+            "pages": [
+              "api/stategraph",
+              "api/compiled-graph",
+              "api/runtime-context",
+              "api/prompts",
+              "api/mcp",
+              "api/patterns"
+            ]
+          },
+          {
+            "group": "C++ API",
+            "pages": [
+              "api/cpp-overview",
+              "api/cpp-execution-engine"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Native C++20 execution engine with Python bindings for high-performance graph workflows",
+    "Explicit state-patch model for deterministic commit ordering, replay, and checkpointing",
+    "Persistent subgraph sessions with isolated child state and deterministic session revisions",
+    "Structured intelligence state: tasks, claims, evidence, decisions, and memories",
+    "Context assembly with native context-graph ranking and citation support",
+    "MCP (Model Context Protocol) interoperability for consuming and exposing tools/prompts",
+    "External graph-store integration with InMemoryGraphStore and Neo4j backends",
+    "OpenTelemetry opt-in observability with run spans, node spans, and metrics",
+    "Multi-worker scheduling with async wait handling and deterministic memoization",
+    "Pause, resume, and replay support via checkpoint and proof digest infrastructure"
+  ],
+  "publicApiSurface": [
+    "StateGraph(state_schema, *, name, worker_count)",
+    "CompiledStateGraph.invoke(input_state, *, config)",
+    "CompiledStateGraph.invoke_with_metadata(input_state, *, config, telemetry)",
+    "CompiledStateGraph.stream(input_state, *, stream_mode)",
+    "CompiledStateGraph.resume_with_metadata(checkpoint_id)",
+    "StateGraph.add_node(name, action, *, context, intelligence_subscriptions)",
+    "StateGraph.add_subgraph(name, graph, *, session_mode, session_id_from)",
+    "StateGraph.add_conditional_edges(source, path, path_map)",
+    "ContextSpec(goal_key, include, budget_tokens, require_citations)",
+    "RuntimeContext.intelligence / .knowledge / .context / .graph_stores",
+    "RuntimeContext.invoke_tool(name, request)",
+    "RuntimeContext.invoke_model(name, prompt, schema)",
+    "PromptTemplate / ChatPromptTemplate / MessageTemplate",
+    "OpenTelemetryObserver(tracer, meter, emit_node_spans, emit_metrics)",
+    "StdioMCPClient(command, *, startup_timeout, request_timeout)",
+    "MCPServer(*, name, version, instructions)",
+    "InMemoryGraphStore / Neo4jGraphStore",
+    "PipelineGraph / SpecialistTeam / Specialist",
+    "IntelligenceRule / IntelligenceRouter / IntelligenceSubscription",
+    "agentcore-mcp / agentcore-mcp-server / agentcore-mcp-config (CLI commands)"
+  ]
+}

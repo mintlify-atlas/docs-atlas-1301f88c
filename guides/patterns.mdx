@@ -1,0 +1,266 @@
+---
+title: "Higher-level graph patterns in AgentCore"
+description: "Use PipelineGraph for sequential stage workflows and SpecialistTeam for parallel dispatch fan-out, instead of writing repetitive StateGraph wiring by hand."
+---
+
+`StateGraph` is the core Python API and handles any graph topology. For two common shapes that otherwise require repetitive builder code, AgentCore provides optional higher-level helpers: `PipelineGraph` for sequential stage workflows and `SpecialistTeam` for dispatch fan-out across specialist agents. Both helpers compile into the same native-backed `StateGraph` runtime.
+
+## PipelineGraph
+
+`PipelineGraph` is useful when the only manual wiring would be `START -> step1 -> step2 -> ... -> END`. It removes that boilerplate while keeping the same native execution path.
+
+### Basic usage
+
+```python
+from agentcore import PipelineGraph
+
+
+pipeline = PipelineGraph(dict, name="draft_pipeline", worker_count=2)
+pipeline.add_step("seed", lambda state, config: {"topic": "native-runtime"})
+pipeline.add_step("draft", lambda state, config: {"draft": f"draft::{state['topic']}"})
+pipeline.add_step("finalize", lambda state, config: {"final": f"{state['draft']}::final"})
+
+compiled = pipeline.compile()
+result = compiled.invoke({})
+print(result["final"])  # draft::native-runtime::final
+```
+
+### With a typed schema
+
+```python
+from typing import TypedDict
+from agentcore import PipelineGraph
+
+
+class PipelineState(TypedDict, total=False):
+    raw_text: str
+    cleaned_text: str
+    summary: str
+
+
+def clean(state, config):
+    return {"cleaned_text": state["raw_text"].strip().lower()}
+
+
+def summarize(state, config):
+    words = state["cleaned_text"].split()
+    return {"summary": " ".join(words[:10])}
+
+
+pipeline = PipelineGraph(PipelineState, name="text_pipeline", worker_count=2)
+pipeline.add_step("clean", clean)
+pipeline.add_step("summarize", summarize)
+
+compiled = pipeline.compile()
+result = compiled.invoke({"raw_text": "  Hello World from AgentCore  "})
+print(result["summary"])
+```
+
+### PipelineGraph API
+
+```python
+PipelineGraph(state_schema=None, *, name=None, worker_count=1)
+```
+
+| Method | Description |
+|---|---|
+| `add_step(name, action, *, kind, stop_after, merge, ...)` | Append a step. Same node options as `StateGraph.add_node(...)`. |
+| `extend(steps)` | Append multiple `PipelineStep` instances at once. |
+| `build()` | Returns the underlying `StateGraph` without compiling. |
+| `compile(*, worker_count=None)` | Builds and compiles the graph. |
+
+`PipelineStep` is a frozen dataclass you can construct explicitly when building pipelines programmatically:
+
+```python
+from agentcore.patterns import PipelineStep
+
+steps = [
+    PipelineStep("ingest", ingest_fn),
+    PipelineStep("enrich", enrich_fn),
+    PipelineStep("emit",   emit_fn),
+]
+
+pipeline = PipelineGraph(dict, name="etl")
+pipeline.extend(steps)
+compiled = pipeline.compile()
+```
+
+### When to use PipelineGraph vs StateGraph
+
+Use `PipelineGraph` when:
+- The workflow is strictly sequential with no branching, fan-out, or conditional edges.
+- Every step writes into shared state that the next step reads.
+
+Use `StateGraph` directly when:
+- You need conditional edges, fan-out, joins, or subgraphs.
+- You want to attach `ContextSpec`, `intelligence_subscriptions`, or `deterministic=True` to specific nodes.
+
+## SpecialistTeam
+
+`SpecialistTeam` targets a specific multi-agent shape: a dispatch node fans out to one or more specialist subgraphs in parallel, each specialist runs with its own persistent session, and an aggregate node joins all specialist results. Writing this with raw `StateGraph` requires repeated fan-out/join/subgraph wiring. `SpecialistTeam` keeps that structure explicit while removing the repetition.
+
+### Basic usage
+
+```python
+from agentcore import SpecialistTeam, StateGraph
+from agentcore.graph import END, START
+
+
+# Define the specialist child graph
+specialist = StateGraph(dict, name="specialist_child", worker_count=2)
+specialist.add_node(
+    "answer",
+    lambda state, config: {
+        "answer": f"{state['session_id']}::{state['query']}",
+    },
+)
+specialist.add_edge(START, "answer")
+specialist.add_edge("answer", END)
+
+# Build the team
+team = SpecialistTeam(dict, name="review_team", worker_count=4)
+
+team.set_dispatch("dispatch", lambda state, config: {"topic": "scheduler"})
+
+team.add_specialist(
+    "planner",
+    specialist,
+    prepare=lambda state, config: {
+        "planner_session_id": "planner",
+        "planner_query": f"plan::{state['topic']}",
+    },
+    inputs={
+        "planner_session_id": "session_id",
+        "planner_query": "query",
+    },
+    outputs={"planner_answer": "answer"},
+)
+
+team.add_specialist(
+    "critic",
+    specialist,
+    prepare=lambda state, config: {
+        "critic_session_id": "critic",
+        "critic_query": f"critique::{state['topic']}",
+    },
+    inputs={
+        "critic_session_id": "session_id",
+        "critic_query": "query",
+    },
+    outputs={"critic_answer": "answer"},
+)
+
+team.set_aggregate(
+    "synthesize",
+    lambda state, config: {
+        "summary": f"{state['planner_answer']}|{state['critic_answer']}",
+    },
+)
+
+compiled = team.compile()
+details = compiled.invoke_with_metadata({})
+```
+
+### What SpecialistTeam builds
+
+The `build()` method produces a `StateGraph` with the following fixed structure:
+
+```text
+START -> dispatch -> planner__prepare -> planner \
+                  -> critic__prepare  -> critic   -> synthesize -> END
+```
+
+- The dispatch node is a `kind="control"` fan-out node with `create_join_scope=True`.
+- Optional `prepare` steps per specialist run before the specialist subgraph and write preparation state into parent state.
+- Each specialist is a persistent subgraph with isolated child state.
+- The aggregate node is a `kind="aggregate"` join node that receives all specialist outputs.
+
+### Persistent session inference
+
+When a specialist has a single input binding that maps a parent field to child `session_id`, `SpecialistTeam` infers `session_id_from` automatically:
+
+```python
+team.add_specialist(
+    "planner",
+    specialist,
+    inputs={
+        "planner_session_id": "session_id",  # inferred: session_id_from="planner_session_id"
+        "planner_query": "query",
+    },
+    outputs={"planner_answer": "answer"},
+)
+```
+
+If multiple input bindings map to child `session_id`, or if you want to be explicit, pass `session_id_from` directly:
+
+```python
+team.add_specialist(
+    "planner",
+    specialist,
+    inputs={"p_sid": "session_id", "p_query": "query"},
+    outputs={"p_answer": "answer"},
+    session_id_from="p_sid",
+)
+```
+
+### Ephemeral specialists
+
+The default `session_mode` is `"persistent"`. To use ephemeral sessions, set `session_mode="ephemeral"` and omit `session_id_from`:
+
+```python
+team.add_specialist(
+    "validator",
+    validator_graph,
+    inputs={"input_data": "data"},
+    outputs={"validation_result": "result"},
+    session_mode="ephemeral",
+)
+```
+
+### SpecialistTeam API
+
+```python
+SpecialistTeam(state_schema=None, *, name=None, worker_count=4)
+```
+
+| Method | Description |
+|---|---|
+| `set_dispatch(name, action, *, kind)` | Configure the fan-out dispatch node. |
+| `set_aggregate(name, action, *, merge, kind)` | Configure the join aggregate node. |
+| `add_specialist(specialist, graph, *, inputs, outputs, namespace, propagate_knowledge_graph, session_mode, session_id_from, prepare, prepare_kind)` | Register a specialist subgraph. |
+| `build()` | Returns the underlying `StateGraph` without compiling. |
+| `compile(*, worker_count=None)` | Builds and compiles the graph. |
+
+`Specialist` is a frozen dataclass for explicit specialist configuration:
+
+```python
+from agentcore.patterns import Specialist
+
+specialist_spec = Specialist(
+    name="planner",
+    graph=planner_graph,
+    inputs={"planner_sid": "session_id", "planner_q": "query"},
+    outputs={"planner_ans": "answer"},
+    session_mode="persistent",
+    prepare=my_prepare_fn,
+)
+
+team.add_specialist(specialist_spec)
+```
+
+### When to use SpecialistTeam vs StateGraph
+
+Use `SpecialistTeam` when:
+- Multiple specialist agents should run in parallel after a shared dispatch step.
+- Each specialist needs persistent, isolated session state.
+- A single aggregate node synthesizes all specialist outputs.
+
+Use `StateGraph` directly when:
+- You need conditional routing after dispatch (different specialists based on state).
+- Some specialists should chain sequentially rather than in parallel.
+- The join logic is complex enough to warrant explicit `merge={...}` rules on multiple fields.
+- You need to attach `ContextSpec` or `intelligence_subscriptions` to individual specialist nodes.
+
+<Tip>
+`SpecialistTeam.build()` returns a plain `StateGraph`. You can inspect, modify, or add additional edges to it before calling `.compile()` if the default topology is close but not quite right.
+</Tip>

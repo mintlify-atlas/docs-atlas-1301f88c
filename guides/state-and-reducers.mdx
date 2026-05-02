@@ -1,0 +1,242 @@
+---
+title: "State schemas and reducers in AgentCore"
+description: "Define typed state schemas with Annotated reducers, use MessagesState for message history, and control how branches merge fields at join barriers."
+---
+
+AgentCore nodes return state patches rather than mutating shared state. When multiple branches write to the same field before a join, the runtime needs to know how to combine those writes. Reducers express that merge rule directly on the field's type annotation so the native join engine can apply it without a Python callback at the barrier.
+
+## Plain dict state
+
+The simplest state schema is `dict`. There are no inferred reducer rules, so the last writer wins for every field at a join.
+
+```python
+from agentcore.graph import END, START, StateGraph
+
+
+def step(state, config):
+    return {"count": int(state.get("count", 0)) + 1}
+
+
+def route(state, config):
+    return END if state["count"] >= 3 else "step"
+
+
+graph = StateGraph(dict, name="counter", worker_count=2)
+graph.add_node("step", step)
+graph.add_edge(START, "step")
+graph.add_conditional_edges("step", route, {END: END, "step": "step"})
+
+compiled = graph.compile()
+result = compiled.invoke({"count": 0})
+print(result["count"])  # 3
+```
+
+Use `dict` state for simple sequential graphs where branch merging is not a concern. When you need deterministic join behavior across parallel branches, declare a typed schema instead.
+
+## TypedDict schemas with Annotated reducers
+
+If your state schema is a `TypedDict` with `Annotated[...]` fields, AgentCore infers a native reducer strategy for each annotated field and applies it at join barriers without a Python round-trip.
+
+```python
+import operator
+from typing import Annotated, TypedDict
+
+from agentcore.graph import START, StateGraph
+
+
+class ReviewState(TypedDict, total=False):
+    score: Annotated[int, operator.add]
+    notes: Annotated[list[str], operator.add]
+    approved: Annotated[bool, operator.or_]
+    summary: str
+
+
+graph = StateGraph(ReviewState, name="review", worker_count=4)
+graph.add_fanout("fanout")
+graph.add_node("left", lambda state, config: {"score": 1, "notes": ["left"], "approved": False})
+graph.add_node("right", lambda state, config: {"score": 2, "notes": ["right"], "approved": True})
+graph.add_join(
+    "join",
+    lambda state, config: {
+        "summary": f"{state['score']}::{','.join(state['notes'])}::{state['approved']}",
+    },
+)
+graph.add_edge(START, "fanout")
+graph.add_edge("fanout", "left")
+graph.add_edge("fanout", "right")
+graph.add_edge(["left", "right"], "join")
+graph.set_finish_point("join")
+```
+
+After the join, `score` is `3` (1 + 2), `notes` is `["left", "right"]`, and `approved` is `True` (False or True).
+
+### Supported reducer annotations
+
+<Tabs>
+  <Tab title="Integer reducers">
+    ```python
+    import operator
+    from typing import Annotated, TypedDict
+
+    class CountState(TypedDict, total=False):
+        total: Annotated[int, operator.add]   # sum across branches
+        best:  Annotated[int, max]             # keep highest value
+        worst: Annotated[int, min]             # keep lowest value
+    ```
+
+    | Annotation | Native strategy | Behavior |
+    |---|---|---|
+    | `Annotated[int, operator.add]` | `sum_int64` | Adds all branch values |
+    | `Annotated[int, max]` | `max_int64` | Keeps the highest value |
+    | `Annotated[int, min]` | `min_int64` | Keeps the lowest value |
+  </Tab>
+  <Tab title="List reducers">
+    ```python
+    import operator
+    from typing import Annotated, TypedDict
+
+    from agentcore.graph import add_messages
+
+    class ListState(TypedDict, total=False):
+        items:    Annotated[list[str], operator.add]   # concatenate lists
+        messages: Annotated[list[dict], add_messages]  # merge by id
+    ```
+
+    | Annotation | Native strategy | Behavior |
+    |---|---|---|
+    | `Annotated[list[T], operator.add]` | `concat_sequence` | Concatenates lists in deterministic branch order |
+    | `Annotated[list[dict], add_messages]` | `merge_messages` | Appends new messages; replaces messages with matching `id` |
+  </Tab>
+  <Tab title="Boolean reducers">
+    ```python
+    import operator
+    from typing import Annotated, TypedDict
+
+    class FlagState(TypedDict, total=False):
+        any_failed:  Annotated[bool, operator.or_]   # True if any branch set True
+        all_passed:  Annotated[bool, operator.and_]  # True only if all branches set True
+    ```
+
+    | Annotation | Native strategy | Behavior |
+    |---|---|---|
+    | `Annotated[bool, operator.or_]` | `logical_or` | `True` if any branch wrote `True` |
+    | `Annotated[bool, operator.and_]` | `logical_and` | `True` only if all branches wrote `True` |
+  </Tab>
+</Tabs>
+
+<Note>
+Reducers outside this supported subset are not inferred automatically. Use explicit `merge={...}` rules on the join node or add a dedicated post-join aggregation step for custom merge shapes.
+</Note>
+
+## MessagesState
+
+Agent workflows that track conversation history can extend `MessagesState`. It declares a `messages` field typed as `Annotated[list[dict], add_messages]`, which compiles to the native `merge_messages` strategy at join barriers.
+
+```python
+from agentcore.graph import MessagesState, START, StateGraph
+
+
+class AgentState(MessagesState, total=False):
+    summary: str
+
+
+graph = StateGraph(AgentState, name="agent", worker_count=4)
+```
+
+`AgentState` inherits the `messages` field with its reducer, and adds an undecorated `summary` field with last-writer-wins semantics.
+
+### How add_messages works
+
+The `add_messages` function merges two message lists. Messages with a non-empty `id` replace the earlier message with the same `id` in place while preserving its position. Messages without an `id` always append.
+
+```python
+from agentcore.graph import add_messages
+
+left = [
+    {"id": "msg-1", "role": "user", "content": "hello"},
+    {"role": "assistant", "content": "no id, will append"},
+]
+right = [
+    {"id": "msg-1", "role": "user", "content": "hello (revised)"},
+    {"role": "assistant", "content": "new message"},
+]
+
+merged = add_messages(left, right)
+# [
+#   {"id": "msg-1", "role": "user", "content": "hello (revised)"},  # replaced in place
+#   {"role": "assistant", "content": "no id, will append"},
+#   {"role": "assistant", "content": "new message"},                 # appended
+# ]
+```
+
+This behavior is the same whether `add_messages` runs as a Python function or through the native `merge_messages` join strategy. Using `MessagesState` or `Annotated[list[dict], add_messages]` routes through the native path at join barriers, which avoids a Python round-trip.
+
+### Fan-out and join with message state
+
+```python
+from agentcore.graph import MessagesState, START, StateGraph
+
+
+class AgentState(MessagesState, total=False):
+    summary: str
+
+
+graph = StateGraph(AgentState, name="message_join", worker_count=4)
+graph.add_fanout("fanout")
+graph.add_node("draft", lambda state, config: {
+    "messages": [{"id": "draft", "role": "assistant", "content": "draft answer"}],
+})
+graph.add_node("revise", lambda state, config: {
+    "messages": [{"id": "draft", "role": "assistant", "content": "revised answer"}],
+})
+graph.add_join("join", lambda state, config: {
+    "summary": state["messages"][-1]["content"],
+})
+graph.add_edge(START, "fanout")
+graph.add_edge("fanout", "draft")
+graph.add_edge("fanout", "revise")
+graph.add_edge(["draft", "revise"], "join")
+graph.set_finish_point("join")
+
+result = graph.compile().invoke({"messages": []})
+# summary is "revised answer" because "draft" id was replaced in place
+```
+
+## Explicit merge rules on join nodes
+
+For schemas without `Annotated` fields, or for fields where you want to override the inferred rule, pass `merge={...}` directly to `add_join(...)`. The keys are field names and the values are strategy names.
+
+```python
+graph.add_join(
+    "join",
+    my_action,
+    merge={
+        "count":    "sum_int64",
+        "approved": "logical_or",
+        "notes":    "concat_sequence",
+        "messages": "merge_messages",
+    },
+)
+```
+
+Valid strategy names are: `require_equal`, `require_single_writer`, `last_writer_wins`, `first_writer_wins`, `sum_int64`, `max_int64`, `min_int64`, `logical_or`, `logical_and`, `concat_sequence`, `merge_messages`.
+
+<Tip>
+Schema-inferred reducer rules and explicit `merge={...}` rules are merged at compile time. Explicit rules on the join node take precedence over schema-inferred ones for the same field.
+</Tip>
+
+## Deterministic memoization for pure nodes
+
+If a node is a pure function of a declared subset of state fields, you can opt into native result caching. The runtime keys the cache on the declared `read_keys` plus the runtime config payload and invalidates entries when any of those keys change.
+
+```python
+graph.add_node(
+    "score",
+    score_candidate,
+    deterministic=True,
+    read_keys=["candidate_id", "rubric_version"],
+    cache_size=32,
+)
+```
+
+The cache lives in the native runtime, not in Python. It is invalidated automatically when a relevant key changes, which makes it safe to use alongside branch joins and intelligence writes.

@@ -1,0 +1,418 @@
+---
+title: "Higher-level patterns API reference"
+description: "Complete reference for PipelineGraph and SpecialistTeam, the optional builder layer that compiles into the same native StateGraph runtime underneath."
+---
+
+`agentcore.patterns` provides two optional higher-level builder classes that eliminate repetitive graph wiring for common workflow shapes. Both classes produce a standard `StateGraph` through `.build()` and a `CompiledStateGraph` through `.compile()`, backed by the same native C++20 runtime as hand-wired graphs.
+
+```python
+from agentcore import PipelineGraph, PipelineStep, SpecialistTeam, Specialist
+```
+
+## `PipelineGraph`
+
+`PipelineGraph` is the builder for strictly sequential stage workflows. It removes the repetitive `START → step1 → step2 → … → END` wiring while preserving the same native execution path.
+
+### Constructor
+
+```python
+pipeline = PipelineGraph(state_schema=None, *, name=None, worker_count=1)
+```
+
+<ParamField path="state_schema" type="type | None" default="None">
+  A `TypedDict` subclass or annotated class. Passed through to the underlying `StateGraph` for schema-driven reducer inference.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Graph name. Defaults to `state_schema.__name__` if available, otherwise `"agentcore_pipeline"`.
+</ParamField>
+
+<ParamField path="worker_count" type="int" default="1">
+  Worker thread count for the compiled graph.
+</ParamField>
+
+### Methods
+
+#### `add_step`
+
+```python
+pipeline.add_step(
+    name,
+    action=None,
+    *,
+    kind="compute",
+    stop_after=False,
+    allow_fan_out=False,
+    create_join_scope=False,
+    join_incoming_branches=False,
+    merge=None,
+)
+```
+
+Appends a step to the pipeline. Steps execute in the order they are added.
+
+<ParamField path="name" type="str">
+  Step node name. Must be unique within the pipeline and must not be `START` or `END`.
+</ParamField>
+
+<ParamField path="action" type="callable | None" default="None">
+  The Python callback for this step. Accepts `state`, `(state, config)`, or `(state, config, runtime)`.
+</ParamField>
+
+<ParamField path="kind" type="str" default='"compute"'>
+  Node kind. Same set as `StateGraph.add_node`: `compute`, `control`, `tool`, `model`, `aggregate`, `human`.
+</ParamField>
+
+<ParamField path="stop_after" type="bool" default="false">
+  Pauses the run after this step, enabling human-in-the-loop patterns.
+</ParamField>
+
+<ParamField path="allow_fan_out" type="bool" default="false">
+  Permits this step to issue multiple outgoing transitions.
+</ParamField>
+
+<ParamField path="create_join_scope" type="bool" default="false">
+  Opens a native join scope at this step.
+</ParamField>
+
+<ParamField path="join_incoming_branches" type="bool" default="false">
+  Marks this step as the join point for an open scope.
+</ParamField>
+
+<ParamField path="merge" type="dict | None" default="None">
+  Explicit merge-strategy overrides for join steps.
+</ParamField>
+
+#### `extend`
+
+```python
+pipeline.extend(steps)
+```
+
+Appends multiple `PipelineStep` instances in one call. Each entry must be a `PipelineStep` dataclass.
+
+#### `build`
+
+```python
+graph = pipeline.build()  # returns StateGraph
+```
+
+Constructs the underlying `StateGraph` with all wiring applied. Raises `ValueError` if no steps have been added.
+
+#### `compile`
+
+```python
+compiled = pipeline.compile(*, worker_count=None)  # returns CompiledStateGraph
+```
+
+Calls `.build()` then `.compile()` on the resulting graph. `worker_count` overrides the pipeline's constructor value when provided.
+
+### `PipelineStep`
+
+```python
+from agentcore import PipelineStep
+
+step = PipelineStep(
+    name,
+    action=None,
+    kind="compute",
+    stop_after=False,
+    allow_fan_out=False,
+    create_join_scope=False,
+    join_incoming_branches=False,
+    merge=frozendict(),
+)
+```
+
+Frozen dataclass used with `PipelineGraph.extend(...)`. Fields mirror the `add_step` parameters.
+
+## `SpecialistTeam`
+
+`SpecialistTeam` lowers a common multi-agent shape into a dispatch fan-out, optional per-specialist preparation, subgraph invocation, and aggregate join — all in one builder. The compiled graph runs the same native execution engine as any other `StateGraph`.
+
+### Constructor
+
+```python
+team = SpecialistTeam(state_schema=None, *, name=None, worker_count=4)
+```
+
+<ParamField path="state_schema" type="type | None" default="None">
+  Passed through to the underlying `StateGraph`.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Graph name. Defaults to `state_schema.__name__` if available, otherwise `"agentcore_specialist_team"`.
+</ParamField>
+
+<ParamField path="worker_count" type="int" default="4">
+  Worker thread count. Defaults to 4 to support parallel specialist execution.
+</ParamField>
+
+### Methods
+
+#### `set_dispatch`
+
+```python
+team.set_dispatch(name="dispatch", action=None, *, kind="control")
+```
+
+Configures the fan-out dispatch node. The dispatch node opens a join scope automatically and routes to all registered specialists.
+
+<ParamField path="name" type="str" default='"dispatch"'>
+  Node name for the dispatch step.
+</ParamField>
+
+<ParamField path="action" type="callable | None" default="None">
+  Optional callback invoked before the fan-out. Can write state updates visible to all specialist branches.
+</ParamField>
+
+<ParamField path="kind" type="str" default='"control"'>
+  Node kind for the dispatch node.
+</ParamField>
+
+#### `set_aggregate`
+
+```python
+team.set_aggregate(name="aggregate", action=None, *, merge=None, kind="aggregate")
+```
+
+Configures the join aggregate node that collects all specialist results.
+
+<ParamField path="name" type="str" default='"aggregate"'>
+  Node name for the aggregate step.
+</ParamField>
+
+<ParamField path="action" type="callable | None" default="None">
+  Optional callback invoked after all branches complete.
+</ParamField>
+
+<ParamField path="merge" type="dict | None" default="None">
+  Explicit field-level merge strategy overrides for the join node.
+</ParamField>
+
+<ParamField path="kind" type="str" default='"aggregate"'>
+  Node kind for the aggregate node.
+</ParamField>
+
+#### `add_specialist`
+
+```python
+team.add_specialist(
+    specialist,
+    graph=None,
+    *,
+    inputs=None,
+    outputs=None,
+    namespace=None,
+    propagate_knowledge_graph=False,
+    session_mode="persistent",
+    session_id_from=None,
+    prepare=None,
+    prepare_kind="compute",
+)
+```
+
+Registers one specialist subgraph. Accepts either a `Specialist` dataclass (all options pre-configured) or a name string plus `graph` keyword argument.
+
+<ParamField path="specialist" type="Specialist | str">
+  A pre-configured `Specialist` instance, or a name string when providing `graph` inline.
+</ParamField>
+
+<ParamField path="graph" type="StateGraph | CompiledStateGraph | None" default="None">
+  Required when `specialist` is a name string.
+</ParamField>
+
+<ParamField path="inputs" type="dict[str, str] | None" default="None">
+  Maps parent state field names to child state field names.
+</ParamField>
+
+<ParamField path="outputs" type="dict[str, str] | None" default="None">
+  Maps child state field names back to parent state field names.
+</ParamField>
+
+<ParamField path="namespace" type="str | None" default="None">
+  State namespace for this specialist. Defaults to the specialist name.
+</ParamField>
+
+<ParamField path="propagate_knowledge_graph" type="bool" default="false">
+  When `True`, the parent's native knowledge graph is shared with this specialist's run.
+</ParamField>
+
+<ParamField path="session_mode" type="str" default='"persistent"'>
+  `"ephemeral"` or `"persistent"`. Specialists default to `"persistent"` to maintain state across invocations.
+</ParamField>
+
+<ParamField path="session_id_from" type="str | None" default="None">
+  Names the parent state field carrying the session ID. Inferred automatically when exactly one input binding maps a parent field to child `session_id`.
+</ParamField>
+
+<ParamField path="prepare" type="callable | None" default="None">
+  Optional pre-processing callback executed before the specialist subgraph. Inserted as a `{specialist_name}__prepare` node.
+</ParamField>
+
+<ParamField path="prepare_kind" type="str" default='"compute"'>
+  Node kind for the prepare node.
+</ParamField>
+
+#### `build`
+
+```python
+graph = team.build()  # returns StateGraph
+```
+
+Constructs the underlying `StateGraph` with the dispatch–specialists–aggregate topology wired in. Raises `ValueError` if no specialists have been added.
+
+#### `compile`
+
+```python
+compiled = team.compile(*, worker_count=None)  # returns CompiledStateGraph
+```
+
+Calls `.build()` then `.compile()`. `worker_count` overrides the constructor value when provided.
+
+### `Specialist`
+
+```python
+from agentcore import Specialist
+
+spec = Specialist(
+    name,
+    graph,
+    inputs=frozendict(),
+    outputs=frozendict(),
+    namespace=None,
+    propagate_knowledge_graph=False,
+    session_mode="persistent",
+    session_id_from=None,
+    prepare=None,
+    prepare_kind="compute",
+)
+```
+
+Frozen dataclass holding all configuration for one specialist. Fields mirror the `add_specialist` keyword parameters. Pass a `Specialist` instance to `team.add_specialist(spec)` for reusable specialist definitions.
+
+## Relation to `StateGraph`
+
+Both `PipelineGraph` and `SpecialistTeam` are pure Python builder helpers. They produce a standard `StateGraph` via `.build()` and compile to a standard `CompiledStateGraph` via `.compile()`. There is no runtime difference between a graph built with these helpers and an equivalent graph built by hand with `StateGraph`.
+
+## Code examples
+
+<CodeGroup>
+
+```python PipelineGraph — sequential stages
+from agentcore import PipelineGraph
+from typing import TypedDict
+
+class State(TypedDict, total=False):
+    text: str
+    tokens: list[str]
+    summary: str
+
+def tokenize(state):
+    return {"tokens": state["text"].split()}
+
+def summarize(state, config, runtime):
+    joined = " ".join(state.get("tokens", []))
+    result = runtime.invoke_model("chat", f"Summarize: {joined}")
+    return {"summary": result}
+
+pipeline = (
+    PipelineGraph(State, name="text-pipeline")
+    .add_step("tokenize", tokenize)
+    .add_step("summarize", summarize)
+)
+compiled = pipeline.compile()
+compiled.models.register_openai_chat(name="chat", provider_model_name="gpt-4o")
+
+output = compiled.invoke({"text": "AgentCore is a native C++20 agent-graph runtime."})
+print(output["summary"])
+```
+
+```python SpecialistTeam — parallel multi-agent
+from agentcore import SpecialistTeam, StateGraph, START, END
+from typing import Annotated, TypedDict
+import operator
+
+class TeamState(TypedDict, total=False):
+    query: str
+    results: Annotated[list[str], operator.add]
+
+# Build two specialist graphs
+def search_specialist(state):
+    return {"results": [f"search:{state['query']}"]}
+
+def qa_specialist(state):
+    return {"results": [f"qa:{state['query']}"]}
+
+search_graph = StateGraph(name="search").add_node("run", search_specialist)
+search_graph.add_edge(START, "run")
+search_graph.add_edge("run", END)
+
+qa_graph = StateGraph(name="qa").add_node("run", qa_specialist)
+qa_graph.add_edge(START, "run")
+qa_graph.add_edge("run", END)
+
+team = (
+    SpecialistTeam(TeamState, name="research-team", worker_count=4)
+    .set_dispatch("dispatch", lambda s: {})
+    .add_specialist(
+        "search",
+        search_graph,
+        inputs={"query": "query"},
+        outputs={"results": "results"},
+        session_mode="ephemeral",
+    )
+    .add_specialist(
+        "qa",
+        qa_graph,
+        inputs={"query": "query"},
+        outputs={"results": "results"},
+        session_mode="ephemeral",
+    )
+    .set_aggregate("aggregate")
+)
+compiled = team.compile()
+output = compiled.invoke({"query": "What is AgentCore?"})
+print(output["results"])  # ["search:What is AgentCore?", "qa:What is AgentCore?"]
+```
+
+```python PipelineStep dataclass with extend
+from agentcore import PipelineGraph, PipelineStep
+
+steps = [
+    PipelineStep("load",    lambda s: {"data": "loaded"}),
+    PipelineStep("process", lambda s: {"data": s["data"].upper()}),
+    PipelineStep("save",    lambda s: {"saved": True}),
+]
+
+compiled = PipelineGraph(name="etl").extend(steps).compile()
+output = compiled.invoke({})
+print(output["saved"])  # True
+```
+
+```python Specialist with prepare callback
+from agentcore import SpecialistTeam, Specialist, StateGraph, START, END
+
+child = StateGraph(name="worker")
+child.add_node("act", lambda s: {"done": True})
+child.add_edge(START, "act")
+child.add_edge("act", END)
+
+def prepare_fn(state):
+    return {"context": "prepared"}
+
+spec = Specialist(
+    name="worker",
+    graph=child,
+    inputs={"task": "task"},
+    outputs={"done": "worker_done"},
+    session_mode="ephemeral",
+    prepare=prepare_fn,
+    prepare_kind="compute",
+)
+
+team = SpecialistTeam(name="team").add_specialist(spec)
+compiled = team.compile()
+```
+
+</CodeGroup>

@@ -1,0 +1,300 @@
+---
+title: "Prompt templates API reference"
+description: "Complete reference for AgentCore prompt template classes, rendered prompt types, and helper constructors for single-turn and chat prompts."
+---
+
+The `agentcore.prompts` module provides a lightweight prompt-assembly layer that composes well with the native tool and model registries. Templates use Python's `str.format_map` syntax and produce typed rendered objects that can be passed directly to `runtime.invoke_model`, `compiled.models.invoke`, and any surface that accepts a prompt argument.
+
+All prompt classes are frozen dataclasses, so they are safe to share across callbacks.
+
+## `PromptTemplate`
+
+```python
+from agentcore import PromptTemplate
+
+tmpl = PromptTemplate(template, *, defaults=None, name=None)
+```
+
+Single-turn text template. Uses Python `{variable}` substitution syntax. Mappings and sequences without an explicit format specifier are rendered as stable JSON.
+
+<ParamField path="template" type="str">
+  Template string with `{variable}` placeholders.
+</ParamField>
+
+<ParamField path="defaults" type="dict | None" default="None">
+  Default values for template variables. Overridden by values passed at render time.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Optional name for tracing and debugging.
+</ParamField>
+
+### Methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `.variables` | `tuple[str, ...]` | All placeholder names in declaration order. |
+| `.partial(**defaults)` | `PromptTemplate` | Returns a new template with the supplied values merged into defaults. |
+| `.render(values=None, **kwargs)` | `RenderedPrompt` | Renders the template to a `RenderedPrompt`. Raises `KeyError` for missing variables. |
+| `.format(values=None, **kwargs)` | `str` | Convenience wrapper; returns the rendered text string directly. |
+| `.to_model_input()` | `str` | Renders with no extra values and returns the text string. |
+
+```python
+tmpl = PromptTemplate("Summarize: {text}", name="summarize")
+rendered = tmpl.render(text="The quick brown fox")
+print(rendered.text)  # "Summarize: The quick brown fox"
+
+# Partial application
+base = PromptTemplate("Task: {task}. Context: {context}")
+with_task = base.partial(task="classify")
+final = with_task.render(context="a product review")
+```
+
+## `MessageTemplate`
+
+```python
+from agentcore import MessageTemplate
+
+tmpl = MessageTemplate(role, template, *, defaults=None, name=None)
+```
+
+Single-message template that renders to a `PromptMessage` with a fixed role.
+
+<ParamField path="role" type="str">
+  Message role, such as `"system"`, `"user"`, or `"assistant"`.
+</ParamField>
+
+<ParamField path="template" type="str">
+  Template string with `{variable}` placeholders.
+</ParamField>
+
+<ParamField path="defaults" type="dict | None" default="None">
+  Default variable values.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Optional name propagated to the rendered `PromptMessage`.
+</ParamField>
+
+### Methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `.variables` | `tuple[str, ...]` | All placeholder names in declaration order. |
+| `.partial(**defaults)` | `MessageTemplate` | Returns a new template with the supplied defaults merged in. |
+| `.render(values=None, **kwargs)` | `PromptMessage` | Renders the template and returns a `PromptMessage`. |
+| `.format(values=None, **kwargs)` | `str` | Returns the rendered content string (role excluded). |
+
+```python
+system_msg = MessageTemplate("system", "You are a {persona}.")
+user_msg   = MessageTemplate("user", "Question: {question}")
+
+msg = system_msg.render(persona="helpful assistant")
+print(msg.role, msg.content)  # "system"  "You are a helpful assistant."
+```
+
+## `ChatPromptTemplate`
+
+```python
+from agentcore import ChatPromptTemplate
+
+tmpl = ChatPromptTemplate.from_messages(messages, *, name=None, separator="\n\n")
+```
+
+Multi-message chat template assembled from a list of message inputs.
+
+<ParamField path="messages" type="list">
+  Accepted message forms:
+  - `MessageTemplate(...)`
+  - `PromptMessage(...)`
+  - `(role, template)` string pairs
+  - Mappings with `role` plus `template` or `content`
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Optional name for the rendered prompt.
+</ParamField>
+
+<ParamField path="separator" type="str" default='"\n\n"'>
+  String used between messages when rendering to plain text.
+</ParamField>
+
+### Methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `.variables` | `tuple[str, ...]` | All placeholder names across all messages, in order of first appearance. |
+| `.partial(**defaults)` | `ChatPromptTemplate` | Returns a new template with defaults applied to all messages. |
+| `.render(values=None, **kwargs)` | `RenderedChatPrompt` | Renders all messages and returns a `RenderedChatPrompt`. |
+| `.format(values=None, **kwargs)` | `str` | Returns the rendered chat as a single role-prefixed text string. |
+| `.as_messages(values=None, **kwargs)` | `list[dict]` | Renders and returns the message list as plain dicts. |
+| `.to_model_input(mode="text" \| "messages")` | `str \| list` | Renders with no values. `"text"` returns role-prefixed text; `"messages"` returns the dict list. |
+
+```python
+from agentcore import ChatPromptTemplate
+
+chat = ChatPromptTemplate.from_messages(
+    [
+        ("system", "You are a {persona}."),
+        ("user",   "Translate to {language}: {text}"),
+    ],
+    name="translate",
+)
+
+rendered = chat.render(persona="translator", language="French", text="Hello")
+print(rendered.to_text())
+# SYSTEM:
+# You are a translator.
+#
+# USER:
+# Translate to French: Hello
+```
+
+## `RenderedPrompt`
+
+```python
+from agentcore import RenderedPrompt
+
+rp = RenderedPrompt(text, *, name=None)
+```
+
+The output of `PromptTemplate.render()`. Stringifies to its text content.
+
+<ParamField path="text" type="str">
+  The fully rendered text string.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Optional name carried through from the source template.
+</ParamField>
+
+### Methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `.text` | `str` | The rendered text. |
+| `.to_model_input()` | `str` | Returns `.text`. Accepted by all model invocation surfaces. |
+
+## `RenderedChatPrompt`
+
+```python
+from agentcore import RenderedChatPrompt
+
+rcp = RenderedChatPrompt(messages, *, name=None, separator="\n\n")
+```
+
+The output of `ChatPromptTemplate.render()`. Holds an immutable tuple of `PromptMessage` objects.
+
+<ParamField path="messages" type="tuple[PromptMessage, ...]">
+  Rendered message objects.
+</ParamField>
+
+<ParamField path="separator" type="str" default='"\n\n"'>
+  String used between messages by `.to_text()`.
+</ParamField>
+
+### Methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `.messages` | `tuple[PromptMessage, ...]` | The rendered messages. |
+| `.as_messages()` | `list[dict]` | Returns the message list as plain `{"role": ..., "content": ...}` dicts. |
+| `.to_text(include_roles=True, separator=None)` | `str` | Joins messages as a role-prefixed text transcript. |
+| `.to_model_input(mode="text" \| "messages")` | `str \| list` | `"text"` calls `.to_text()`; `"messages"` calls `.as_messages()`. |
+
+<Note>
+  Built-in native chat adapters consume text prompt payloads, so `mode="text"` is the default. Use `mode="messages"` for custom Python-backed model handlers registered with `decode_prompt="json"`.
+</Note>
+
+## `RenderedMCPPrompt`
+
+```python
+from agentcore import RenderedMCPPrompt
+
+rmp = RenderedMCPPrompt(messages, *, name=None, description=None, separator="\n\n")
+```
+
+Returned by `StdioMCPClient.get_prompt(...)`. Holds MCP-protocol message dictionaries with typed content blocks.
+
+<ParamField path="messages" type="tuple[dict, ...]">
+  MCP-protocol message dicts, each with `role` and a `content` block.
+</ParamField>
+
+<ParamField path="name" type="str | None" default="None">
+  Prompt name from the MCP server.
+</ParamField>
+
+<ParamField path="description" type="str | None" default="None">
+  Prompt description from the MCP server.
+</ParamField>
+
+<ParamField path="separator" type="str" default='"\n\n"'>
+  String used between messages when rendering to text.
+</ParamField>
+
+### Methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `.messages` | `tuple[dict, ...]` | The raw MCP-protocol message dicts. |
+| `.name` | `str \| None` | The prompt name from the server. |
+| `.description` | `str \| None` | The prompt description. |
+| `.as_messages()` | `list[dict]` | Returns normalized message dicts with MCP-style content blocks. |
+| `.to_text(include_roles=True, separator=None)` | `str` | Flattens the MCP prompt to a role-prefixed text transcript, inlining resource text when available. |
+| `.to_model_input(mode="text" \| "messages" \| "protocol")` | `str \| list` | `"text"` calls `.to_text()`; `"messages"` and `"protocol"` call `.as_messages()`. |
+
+## Code examples
+
+<CodeGroup>
+
+```python Single-turn template
+from agentcore import PromptTemplate
+
+tmpl = PromptTemplate(
+    "You are a {role}. Answer the following: {question}",
+    defaults={"role": "helpful assistant"},
+)
+
+text = tmpl.format(question="What is the capital of France?")
+# "You are a helpful assistant. Answer the following: What is the capital of France?"
+```
+
+```python Chat template with model invocation
+from agentcore import ChatPromptTemplate
+
+def my_node(state, config, runtime):
+    chat = ChatPromptTemplate.from_messages(
+        [
+            ("system", "You are a {persona}."),
+            ("user", "{user_input}"),
+        ]
+    )
+    rendered = chat.render(persona="concise assistant", user_input=state["query"])
+    reply = runtime.invoke_model("chat", rendered)
+    return {"reply": reply}
+```
+
+```python Partial application
+from agentcore import ChatPromptTemplate
+
+base = ChatPromptTemplate.from_messages(
+    [
+        ("system", "You speak {language}."),
+        ("user", "{message}"),
+    ]
+)
+
+french_chat = base.partial(language="French")
+rendered = french_chat.render(message="Hello!")
+print(rendered.to_text())
+```
+
+```python MCP prompt to model input
+# get_prompt returns RenderedMCPPrompt
+rendered_mcp = mcp_client.get_prompt("summarize", {"topic": "AI"})
+
+# Pass directly to a model
+output = runtime.invoke_model("chat", rendered_mcp)
+```
+
+</CodeGroup>

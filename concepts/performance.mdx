@@ -1,0 +1,67 @@
+---
+title: "AgentCore performance: benchmarks and execution profiles"
+description: "AgentCore's performance approach, benchmark methodology, ExecutionProfile modes, and representative head-to-head results against LangGraph from April 2026."
+---
+
+AgentCore's performance work focuses on the places where graph runtimes pay recurring overhead: graph dispatch, branch/join bookkeeping, persistent subgraph sessions, resume behavior, context retrieval, public streaming, and structured state operations. This page explains the benchmark methodology and summarizes current results.
+
+<Note>
+All numbers on this page are workload-specific measurements from one machine on one build. They are not universal performance claims. Always name the build type and preset when comparing results.
+</Note>
+
+## ExecutionProfile modes
+
+The engine exposes three durability and observability profiles through `ExecutionEngineOptions`:
+
+| Profile | Checkpoint persistence | Trace retention | Best for |
+|---|---|---|---|
+| `Strict` | Synchronous, on every step | Unbounded | Auditable production workflows |
+| `Balanced` | Background, deterministic commit semantics | Per-run segmented | Most production use cases |
+| `Fast` | Metadata-first | Bounded | Latency-sensitive hot paths |
+
+State patch semantics, routing, replay, persistent sessions, and public stream ordering are identical across all profiles. Only the durability and observability overhead changes.
+
+## Head-to-head benchmark results
+
+These numbers were generated on April 29, 2026 from a `release-perf` build:
+
+- Python 3.9.18, Linux x86_64, Intel Xeon W-10885M @ 2.40GHz
+- LangGraph 0.6.11
+
+### Same-code builder path
+
+| Metric | LangGraph | AgentCore compat | Speedup |
+|---|---:|---:|---:|
+| Invoke avg latency | 13.208 ms | 716.199 µs | **18.44×** faster |
+| Stream avg latency | 9.980 ms | 351.012 µs | **28.43×** faster |
+| Batch avg cost/item | 5.884 ms | 274.951 µs | **21.40×** faster |
+
+### Native runtime features
+
+| Workload | LangGraph | AgentCore native | Speedup |
+|---|---:|---:|---:|
+| Persistent specialist memory (latency/round) | 74.487 ms | 3.425 ms | **21.75×** faster |
+| Persistent specialist memory (peak RSS) | 105.4 MiB | 30.2 MiB | 71.3% less |
+| Pause + resume avg latency | 10.611 ms | 472.280 µs | **22.47×** faster |
+| Session fan-out (24 sessions) avg latency | 157.192 ms | 6.182 ms | **25.43×** faster |
+
+## Native regression benchmark counters
+
+The native benchmarks assert correctness invariants alongside timing. Sample counters from a recent release build:
+
+```text
+context_graph_records=1024
+context_graph_iterations=1024
+context_graph_cold_rank_ns=454200
+context_graph_warm_rank_avg_ns=52
+python_context_graph_warm_view_avg_ns=567840
+python_context_graph_python_rank_avg_ns=9231312
+
+knowledge_ingest_triples=<workload count>
+knowledge_ingest_batches=<workload count>
+knowledge_ingest_exact_matched=<expected matches>
+knowledge_ingest_final_entities=<expected count>
+knowledge_ingest_final_triples=<expected count>
+```
+
+For commands to reproduce these numbers, see [Validation and benchmarks](/operations/validation-and-benchmarks).
